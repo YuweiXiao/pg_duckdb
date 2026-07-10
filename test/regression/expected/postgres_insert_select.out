@@ -172,24 +172,47 @@ SELECT * FROM tbl1;
 (1 row)
 
 DROP TABLE tbl, tbl1;
--- case: UPDATE/DELETE should be blocked
-SET duckdb.log_pg_explain to on;
+-- case: UPDATE/DELETE and INSERT ... VALUES fall back to Postgres execution
 CREATE TABLE tbl (a int PRIMARY KEY, b text);
 INSERT INTO tbl (a, b) SELECT i, 'foo' FROM generate_series(1, 3) i;
 UPDATE tbl SET b = 'bar' WHERE a = 1;
-DELETE FROM tbl WHERE a = 1;
--- INSERT without subquery should also be blocked
-INSERT INTO tbl (a, b) VALUES (1, 'foo');
+DELETE FROM tbl WHERE a = 2;
+INSERT INTO tbl (a, b) VALUES (4, 'baz');
+SELECT * FROM tbl ORDER BY a;
+ a |  b  
+---+-----
+ 1 | bar
+ 3 | foo
+ 4 | baz
+(3 rows)
+
+-- But when such statements require DuckDB execution, falling back to Postgres
+-- is not possible, so they throw an error instead.
+UPDATE tbl SET b = r['x']::text FROM duckdb.query($$ SELECT 'bar' x $$) r WHERE a = 1;
+ERROR:  DuckDB only supports INSERT/SELECT on Postgres tables
+DELETE FROM tbl USING duckdb.query($$ SELECT 1 x $$) r WHERE a = r['x']::int;
+ERROR:  DuckDB only supports INSERT/SELECT on Postgres tables
+INSERT INTO tbl VALUES (5, (SELECT r['x']::text FROM duckdb.query($$ SELECT 'quux' x $$) r));
+ERROR:  DuckDB does not support INSERT without a subquery
 DROP TABLE tbl;
-SET duckdb.log_pg_explain to off;
 -- case: UNSUPPORTED TYPE
 CREATE TABLE tbl (a int, b xml);
 CREATE TABLE tbl1 (a int, b xml);
 INSERT INTO tbl (a, b) VALUES (1, '<xml>foo</xml>');
-SET duckdb.log_pg_explain to on;
+-- This falls back to Postgres execution, because DuckDB doesn't support the
+-- xml type.
 INSERT INTO tbl1 SELECT * FROM tbl;
+SELECT * FROM tbl1;
+WARNING:  (PGDuckDB/CreatePlan) Prepared query returned an error: Not implemented Error: Unsupported PostgreSQL type found in query: Oid=142
+ a |       b        
+---+----------------
+ 1 | <xml>foo</xml>
+(1 row)
+
+-- When DuckDB execution is required we throw an error instead.
+INSERT INTO tbl1 SELECT r['a']::int, NULL FROM duckdb.query($$ SELECT 1 a $$) r;
+ERROR:  DuckDB does not support INSERTs into tables with column `b` of unsupported type (OID 142). 
 DROP TABLE tbl, tbl1;
-SET duckdb.log_pg_explain to off;
 -- case: query with JOIN
 CREATE TABLE tbl (a int, b text);
 CREATE TABLE tbl1 (a int, b1 text, b2 text);
@@ -198,7 +221,7 @@ INSERT INTO tbl (a, b) VALUES (1, 'foo'), (2, 'bar'), (1, 'baz');
 -- included in the output is different for Debug and Release builds of DuckDB.
 INSERT INTO tbl1 SELECT a.a, a.b, b.b FROM tbl a JOIN tbl b ON a.a = b.a;
 SET duckdb.log_pg_explain to on;
--- The following query should be blocked because of VALUE RTE in the subquery
+-- A query with a VALUES RTE in the subquery falls back to Postgres execution
 INSERT INTO tbl1 SELECT a.a, a.b, b.column2 FROM tbl a JOIN (VALUES (2, 'yoyo'), (4, 'yoyo2')) AS b(column1, column2) ON a.a = b.column1;
 SELECT * FROM tbl1 ORDER BY 1, 2, 3;
 NOTICE:  (PGDuckDB/PostgresTableReader)
@@ -218,4 +241,8 @@ Parallel Seq Scan on tbl1
  2 | bar | yoyo
 (6 rows)
 
+SET duckdb.log_pg_explain to off;
+-- When DuckDB execution is required we throw an error instead.
+INSERT INTO tbl1 SELECT r['a']::int, r['b']::text, b.column2 FROM duckdb.query($$ SELECT 2 a, 'x' b $$) r JOIN (VALUES (2, 'yoyo')) AS b(column1, column2) ON r['a']::int = b.column1;
+ERROR:  DuckDB does not support INSERTs with value subqueries
 DROP TABLE tbl, tbl1;
