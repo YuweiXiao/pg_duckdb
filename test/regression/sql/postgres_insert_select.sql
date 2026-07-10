@@ -109,7 +109,8 @@ SET duckdb.log_pg_explain to off;
 CREATE TABLE tbl (a int, b text);
 CREATE TABLE tbl1 (a int, b1 text, b2 text);
 INSERT INTO tbl (a, b) VALUES (1, 'foo'), (2, 'bar'), (1, 'baz');
-EXPLAIN INSERT INTO tbl1 SELECT a.a, a.b, b.b FROM tbl a JOIN tbl b ON a.a = b.a;
+-- We don't EXPLAIN this INSERT, because the DuckDB plan that would be
+-- included in the output is different for Debug and Release builds of DuckDB.
 INSERT INTO tbl1 SELECT a.a, a.b, b.b FROM tbl a JOIN tbl b ON a.a = b.a;
 SET duckdb.log_pg_explain to on;
 -- The following query should be blocked because of VALUE RTE in the subquery
