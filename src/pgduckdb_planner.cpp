@@ -62,19 +62,19 @@ ContainValueRTE(Query *query) {
 
 bool
 IsAllowedPostgresInsert(Query *query, bool throw_error) {
-	if (query->commandType == CMD_SELECT) {
-		return false;
-	}
-
-	int elevel = throw_error ? ERROR : DEBUG4;
-	if (query->commandType != CMD_INSERT) {
-		elog(elevel, "DuckDB only supports INSERT/SELECT on Postgres tables");
+	if (query->commandType == CMD_SELECT || query->resultRelation == 0) {
 		return false;
 	}
 
 	Assert(list_length(query->rtable) >= query->resultRelation);
 	RangeTblEntry *target_rel = (RangeTblEntry *)list_nth(query->rtable, query->resultRelation - 1);
 	if (pgduckdb::IsDuckdbTable(target_rel->relid)) {
+		return false;
+	}
+
+	int elevel = throw_error ? ERROR : DEBUG4;
+	if (query->commandType != CMD_INSERT) {
+		elog(elevel, "DuckDB only supports INSERT/SELECT on Postgres tables");
 		return false;
 	}
 
@@ -92,10 +92,15 @@ IsAllowedPostgresInsert(Query *query, bool throw_error) {
 	}
 
 	/*
-	 * The referenced rtables in the subquery should not include value RTEs. Literal input may vary between Postgres and
-	 * DuckDB, such as differences in bytea representation and numeric rounding.
+	 * If the subquery references value RTEs we prefer executing the statement
+	 * with Postgres, because literal input may vary between Postgres and
+	 * DuckDB, such as differences in bytea representation and numeric
+	 * rounding. But when DuckDB execution is required (which is the case
+	 * whenever throw_error is set, e.g. because the query reads from
+	 * `read_csv(...)`), falling back to Postgres is not an option, so then we
+	 * accept those potential differences.
 	 */
-	if (ContainValueRTE(select_rte->subquery)) {
+	if (!throw_error && ContainValueRTE(select_rte->subquery)) {
 		elog(elevel, "DuckDB does not support INSERTs with value subqueries");
 		return false;
 	}
@@ -130,7 +135,13 @@ duckdb::unique_ptr<duckdb::PreparedStatement>
 DuckdbPrepare(const Query *query, const char *explain_prefix) {
 	Query *copied_query = (Query *)copyObjectImpl(query);
 	const char *query_string;
-	if (IsAllowedPostgresInsert(copied_query)) {
+	/*
+	 * When we get here the decision to use DuckDB has already been made, so
+	 * we pass throw_error=true. This matters for INSERTs with a VALUES RTE in
+	 * their subquery, which are only allowed when DuckDB execution is
+	 * required.
+	 */
+	if (IsAllowedPostgresInsert(copied_query, true)) {
 		RangeTblEntry *select_rte = NULL;
 		foreach_node(RangeTblEntry, rte, copied_query->rtable) {
 			if (rte->rtekind == RTE_SUBQUERY) {
@@ -330,7 +341,7 @@ CreatePlan(Query *query, bool throw_error) {
 		ReleaseSysCache(tp);
 	}
 
-	if (IsAllowedPostgresInsert(query)) {
+	if (IsAllowedPostgresInsert(query, true)) {
 		RangeTblEntry *target_rel = (RangeTblEntry *)list_nth(query->rtable, query->resultRelation - 1);
 		Relation rel = RelationIdGetRelation(target_rel->relid);
 		TupleDesc pg_tupdesc = RelationGetDescr(rel);
@@ -500,7 +511,7 @@ DuckdbPlanNode(Query *parse, int cursor_options, bool throw_error) {
 	 * filled in correctly, and then replace the plan that produces the rows
 	 * to insert with our CustomScan node.
 	 */
-	if (IsAllowedPostgresInsert(parse)) {
+	if (IsAllowedPostgresInsert(parse, true)) {
 		Query *copied_query = (Query *)copyObjectImpl(parse);
 		PlannedStmt *postgres_plan = standard_planner(copied_query, NULL, cursor_options, NULL);
 		Assert(IsA(postgres_plan->planTree, ModifyTable));

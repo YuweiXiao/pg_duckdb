@@ -123,6 +123,8 @@ SET duckdb.log_pg_explain to on;
 INSERT INTO tbl1 SELECT a.a, a.b, b.column2 FROM tbl a JOIN (VALUES (2, 'yoyo'), (4, 'yoyo2')) AS b(column1, column2) ON a.a = b.column1;
 SELECT * FROM tbl1 ORDER BY 1, 2, 3;
 SET duckdb.log_pg_explain to off;
--- When DuckDB execution is required we throw an error instead.
+-- But when DuckDB execution is required, the VALUES RTE is accepted and the
+-- whole SELECT runs in DuckDB.
 INSERT INTO tbl1 SELECT r['a']::int, r['b']::text, b.column2 FROM duckdb.query($$ SELECT 2 a, 'x' b $$) r JOIN (VALUES (2, 'yoyo')) AS b(column1, column2) ON r['a']::int = b.column1;
+SELECT * FROM tbl1 WHERE b1 = 'x';
 DROP TABLE tbl, tbl1;
