@@ -6,38 +6,9 @@ set duckdb.force_duckdb_execution = false;
 -- DuckDB functions from Postgres we need specify their "public" schema. We do
 -- this for all of these functions just to be sure (except for the one test
 -- where we explicitily test correct serialization of the JSON_EXISTS keyword).
--- <JSON_EXISTS>
--- Path exists in a simple JSON object (using a json type)
-SELECT public.json_exists('{"a": {"b": 1}}'::json, '$.a.b'); -- Expected: true
- json_exists 
--------------
- t
-(1 row)
-
--- Path does not exist in a simple JSON object (using JSONB)
-CREATE TABLE jsonb_table (j JSONB);
-INSERT INTO jsonb_table VALUES ('{"a": {"b": 1}}');
-SELECT public.json_exists(j, '$.a.c') FROM jsonb_table; -- Expected: false
- json_exists 
--------------
- f
-(1 row)
-
--- Without public, but with requiring DuckDB execution. To ensure serialization
--- of JSON_EXISTS keyword is correct.
-SELECT json_exists('{"a": {"b": 1}}', '$.a.c') FROM duckdb.query($$ SELECT 1 $$); -- Expected: false
- json_exists 
--------------
- f
-(1 row)
-
--- BUG: Explicitly specifying the jsonb type causes DuckDB to not understand
--- the query anymore. We should probably serialize this to the json type when
--- we build the query.
-SELECT public.json_exists('{"a": {"b": 1}}'::jsonb, '$.a.c');
-ERROR:  (PGDuckDB/CreatePlan) Prepared query returned an error: 'Catalog Error: Type with name jsonb does not exist!
-Did you mean "blob"?
--- </JSON_EXISTS>
+-- NOTE: JSON_EXISTS is tested separately in json_exists_duckdb, because its
+-- output differs between Postgres versions and keeping it here would require a
+-- separate expected output file for this whole (large) test.
 -- <JSON_EXTRACT>
 -- Basic JSON Extraction (using a string literal)
 SELECT public.json_extract('{"key": "value"}', '$.key') AS result; -- Expected: "value"
@@ -163,8 +134,7 @@ SELECT public.json_array_length('{"not_an_array": {"key": "value"}}', '$.not_an_
 -- BUG: This fails due to not being able to convert the UBIGINT array to a
 -- postgres type yet.
 SELECT public.json_array_length('{"a": [1, 2, 3, 4, 5], "b": [1]}', ARRAY['$.a', 'b']) AS array_length;
-WARNING:  (PGDuckDB/GetPostgresDuckDBType) Unsupported `LIST` subtype 31 to Postgres type
-ERROR:  (PGDuckDB/CreatePlan) Cache lookup failed for type 0
+ERROR:  (PGDuckDB/CreatePlan) Not implemented Error: Unsupported DuckDB `LIST` subtype: UBIGINT
 -- </JSON_ARRAY_LENGTH>
 -- <JSON_CONTAINS>
 -- Simple JSON array with numeric needle

@@ -56,7 +56,7 @@ GetAttName(const Form_pg_attribute att) {
 
 Form_pg_attribute
 GetAttr(const TupleDesc tupleDesc, int i) {
-	return &tupleDesc->attrs[i];
+	return TupleDescAttr(tupleDesc, i);
 }
 
 bool
@@ -66,17 +66,22 @@ TupleIsNull(TupleTableSlot *slot) {
 
 void
 SlotGetAllAttrs(TupleTableSlot *slot) {
-	PostgresFunctionGuard(slot_getallattrs, slot);
+	// It is safe to call slot_getallattrs directly without the PostgresFunctionGuard because the function doesn't
+	// perform any memory allocations. Assertions or errors are guaranteed not to occur for minimal slots.
+	slot_getallattrs(slot);
+}
+
+TupleTableSlot *
+ExecStoreMinimalTupleUnsafe(MinimalTuple minmal_tuple, TupleTableSlot *slot, bool shouldFree) {
+	// It's safe to call ExecStoreMinimalTuple without the PostgresFunctionGuard as long as the slot is not "owned" by
+	// the tuple, i.e., TTS_SHOULDFREE(slot) is false. This is because it does not allocate in memory contexts and the
+	// only error it can throw is when the slot is not a minimal slot. That error is an obvious programming error so we
+	// can ignore it here.
+	return ::ExecStoreMinimalTuple(minmal_tuple, slot, shouldFree);
 }
 
 Relation
 OpenRelation(Oid relationId) {
-	if (PostgresFunctionGuard(check_enable_rls, relationId, InvalidOid, false) == RLS_ENABLED) {
-		throw duckdb::NotImplementedException(
-		    "Cannot use \"%s\" relation in a DuckDB query, because RLS is enabled on it",
-		    PostgresFunctionGuard(get_rel_name, relationId));
-	}
-
 	/*
 	 * We always open & close the relation using the
 	 * TopTransactionResourceOwner to avoid having to close the relation
@@ -118,7 +123,7 @@ EstimateRelSize(Relation rel) {
 	return cardinality;
 }
 
-Oid
+static Oid
 PGGetRelidFromSchemaAndTable(const char *schema_name, const char *entry_name) {
 	List *name_list = NIL;
 	name_list = lappend(name_list, makeString(pstrdup(schema_name)));
@@ -171,5 +176,25 @@ const char *
 GetRelationName(Relation rel) {
 	return RelationGetRelationName(rel);
 }
+
+Oid
+GetOid(Form_pg_class rel) {
+	return rel->oid;
+}
+
+namespace pg {
+
+Form_pg_attribute
+GetAttributeByName(TupleDesc tupdesc, const char *colname) {
+	for (int i = 0; i < tupdesc->natts; i++) {
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+		if (strcmp(NameStr(attr->attname), colname) == 0) {
+			return attr;
+		}
+	}
+	return NULL; // Return NULL if the column name is not found
+}
+
+} // namespace pg
 
 } // namespace pgduckdb

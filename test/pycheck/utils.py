@@ -1,26 +1,24 @@
-import subprocess
-from contextlib import closing, contextmanager, asynccontextmanager, suppress
-from pathlib import Path
-
 import asyncio
 import os
 import platform
 import re
 import shlex
 import socket
+import subprocess
 import sys
 import time
 import typing
-from typing import Any
+from contextlib import asynccontextmanager, closing, contextmanager, suppress
+from pathlib import Path
 from tempfile import gettempdir
-
-import filelock
-import psycopg
-import psycopg.sql
-import psycopg.conninfo
-from psycopg import sql
+from typing import Any
 
 import duckdb
+import filelock
+import psycopg
+import psycopg.conninfo
+import psycopg.sql
+from psycopg import sql
 
 TEST_DIR = Path(os.path.dirname(os.path.realpath(__file__)))
 os.chdir(TEST_DIR)
@@ -128,25 +126,37 @@ def get_bin_dir():
     return capture([pg_config_bin, "--bindir"], silent=True).strip()
 
 
-def create_duckdb(db_name, token):
-    con_string = f"md:?token={token}"
-    con = duckdb.connect(con_string)
-    con.execute(f"DROP DATABASE IF EXISTS {db_name}")
-    con.execute(f"CREATE DATABASE {db_name}")
-    con.execute(f"USE {db_name}")
-    return con
-
-
-def loop_until(timeout=5, error_message="Did not complete in time"):
+def wait_until(error_message="Did not complete in time", timeout=5, interval=1):
     """
     Loop until the timeout is reached. If the timeout is reached, raise an
     exception with the given error message.
     """
     end = time.time() + timeout
+    print_progress = timeout / 10 > 4
+    last_printed_progress = 0
     while time.time() < end:
+        if print_progress and time.time() - last_printed_progress > 4:
+            last_printed_progress = time.time()
+            print(f"{error_message} - will retry")
         yield
-        time.sleep(0.1)
+        time.sleep(interval)
     raise TimeoutError(error_message)
+
+
+def make_new_duckdb_connection(db_name, token, reset=True, hint=None):
+    hint_str = f"&session_hint={hint}" if hint else ""
+    con = duckdb.connect(f"md:?token={token}{hint_str}")
+    if reset:
+        con.execute(f"DROP DATABASE IF EXISTS {db_name}")
+        con.execute(f"CREATE DATABASE {db_name}")
+
+    for _ in wait_until(f"Database {db_name} did not appear in time", timeout=60):
+        try:
+            return con.execute(f"USE {db_name}.main")
+        except duckdb.CatalogException:
+            con.execute("REFRESH DATABASES").fetchall()
+
+    return con
 
 
 PG_MAJOR_VERSION = get_pg_major_version()
@@ -196,6 +206,9 @@ def cleanup_test_leftovers(*nodes):
 
     for node in nodes:
         node.cleanup_replication_slots()
+
+    for node in nodes:
+        node.cleanup_servers()
 
     for node in nodes:
         node.cleanup_schemas()
@@ -312,43 +325,28 @@ class Cursor(OutputSilencer):
 
     def sql(self, query, params=None, **kwargs) -> Any:
         self.execute(query, params, **kwargs)
-        try:
-            return simplify_query_results(self.fetchall())
-        except psycopg.ProgrammingError as e:
-            if "the last operation didn't produce a result" == str(e):
-                # This happens when the query is a DDL statement
-                return NoResult
-            raise
+        if self.pgresult and self.pgresult.status == psycopg.pq.ExecStatus.COMMAND_OK:
+            # This happens when the query is a DDL statement. Calling fetchall
+            # would fail with a ProgrammingError in that case.
+            return NoResult
+
+        return simplify_query_results(self.fetchall())
 
     def dsql(self, query, **kwargs):
         """Run a DuckDB query using duckdb.query()"""
         return self.sql(f"SELECT * FROM duckdb.query($ddb$ {query} $ddb$)", **kwargs)
 
-    def wait_until(self, func, error_message, timeout=5):
-        while loop_until(
-            error_message=error_message,
-            timeout=timeout,
-        ):
-            if func():
-                return
-
     def wait_until_table_exists(self, table_name, timeout=5, **kwargs):
-        while loop_until(
-            error_message=f"Table {table_name} did not appear in time",
-            timeout=timeout,
-        ):
+        for _ in wait_until(f"Table {table_name} did not appear in time", timeout):
             with self.suppress(psycopg.errors.UndefinedTable):
                 self.sql("SELECT %s::regclass", (table_name,), **kwargs)
-                return
+                break
 
     def wait_until_schema_exists(self, schema_name, timeout=5, **kwargs):
-        while loop_until(
-            timeout=timeout,
-            error_message=f"Schema {schema_name} did not appear in time",
-        ):
+        for _ in wait_until(f"Schema {schema_name} did not appear in time", timeout):
             with self.suppress(psycopg.errors.InvalidSchemaName):
                 self.sql("SELECT %s::regnamespace", (schema_name,), **kwargs)
-                return
+                break
 
 
 class AsyncCursor:
@@ -365,13 +363,12 @@ class AsyncCursor:
 
     async def sql_coroutine(self, query, params=None, **kwargs) -> Any:
         await self.execute(query, params, **kwargs)
-        try:
-            return simplify_query_results(await self.fetchall())
-        except psycopg.ProgrammingError as e:
-            if "the last operation didn't produce a result" == str(e):
-                # This happens when the query is a DDL statement
-                return NoResult
-            raise
+        if self.pgresult and self.pgresult.status == psycopg.pq.ExecStatus.COMMAND_OK:
+            # This happens when the query is a DDL statement. Calling fetchall
+            # would fail with a ProgrammingError in that case.
+            return NoResult
+
+        return simplify_query_results(await self.fetchall())
 
     def dsql(self, query, **kwargs):
         """Run a DuckDB query using duckdb.query()"""
@@ -397,6 +394,7 @@ class Postgres(OutputSilencer):
         self.subscriptions = set()
         self.publications = set()
         self.replication_slots = set()
+        self.servers = set()
         self.schemas = set()
         self.users = set()
 
@@ -566,6 +564,11 @@ class Postgres(OutputSilencer):
         self.schemas.add((dbname, name))
         self.sql(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(name)))
 
+    def create_server(self, name: str, args: psycopg.sql.Composable, dbname=None):
+        dbname = dbname or self.default_db
+        self.servers.add((dbname, name))
+        self.sql(sql.SQL("CREATE SERVER {} {}").format(sql.Identifier(name), args))
+
     def create_publication(self, name: str, args: psycopg.sql.Composable, dbname=None):
         dbname = dbname or self.default_db
         self.publications.add((dbname, name))
@@ -594,8 +597,24 @@ class Postgres(OutputSilencer):
 
     def cleanup_users(self):
         for user in self.users:
+            try:
+                self.sql(
+                    sql.SQL("DROP OWNED BY {} CASCADE").format(sql.Identifier(user))
+                )
+            except psycopg.errors.UndefinedObject:
+                pass
             self.sql(sql.SQL("DROP USER IF EXISTS {}").format(sql.Identifier(user)))
         self.users.clear()
+
+    def cleanup_servers(self):
+        for dbname, schema in self.servers:
+            self.sql(
+                sql.SQL("DROP SERVER IF EXISTS {} CASCADE").format(
+                    sql.Identifier(schema)
+                ),
+                dbname=dbname,
+            )
+        self.servers.clear()
 
     def cleanup_schemas(self):
         for dbname, schema in self.schemas:
@@ -772,6 +791,11 @@ class Postgres(OutputSilencer):
 
     def reset(self):
         os.truncate(self.pgdata / "postgresql.auto.conf", 0)
+        try:
+            self.sql("TRUNCATE duckdb.extensions")
+        except psycopg.errors.InvalidSchemaName:
+            # pg_duckdb is not installed, so no need to reset the extensions
+            pass
 
         # If a previous test restarted postgres, it was probably because of some
         # config that could only be changed across restarts. To reset those, we'll

@@ -34,9 +34,9 @@ DROP TABLE tbl;
 CREATE TABLE tbl (a int PRIMARY KEY, b text) PARTITION BY RANGE (a);
 CREATE TABLE tbl_p1 PARTITION OF tbl FOR VALUES FROM (1) TO (10);
 CREATE TABLE tbl_p2 PARTITION OF tbl FOR VALUES FROM (10) TO (20);
-INSERT INTO tbl select r['a']::int, r['b'] from duckdb.query($$ SELECT 1 a, 'abc' b $$) r;
-INSERT INTO tbl select r['a']::int, r['b'] from duckdb.query($$ SELECT 11 a, 'def' b $$) r;
-INSERT INTO tbl select r['a']::int, r['b'] from duckdb.query($$ SELECT 21 a, 'ghi' b $$) r;
+INSERT INTO tbl select r['a']::int, r['b']::text from duckdb.query($$ SELECT 1 a, 'abc' b $$) r;
+INSERT INTO tbl select r['a']::int, r['b']::text from duckdb.query($$ SELECT 11 a, 'def' b $$) r;
+INSERT INTO tbl select r['a']::int, r['b']::text from duckdb.query($$ SELECT 21 a, 'ghi' b $$) r;
 ERROR:  no partition of relation "tbl" found for row
 DETAIL:  Partition key of the failing row contains (a) = (21).
 SELECT * FROM tbl_p1 ORDER BY a;
@@ -187,10 +187,10 @@ EXPLAIN INSERT INTO tbl1 SELECT a.a, a.b, b.b FROM tbl a JOIN tbl b ON a.a = b.a
  │      Join Type: INNER     │
  │     Conditions: a = a     ├──────────────┐
  │                           │              │
- │         ~1270 Rows        │              │
+ │        ~1,270 rows        │              │
  └─────────────┬─────────────┘              │
  ┌─────────────┴─────────────┐┌─────────────┴─────────────┐
- │  PGDUCKDB_POSTGRES_SCAN   ││  PGDUCKDB_POSTGRES_SCAN   │
+ │   PGDUCKDB_POSTGRES_SCAN  ││   PGDUCKDB_POSTGRES_SCAN  │
  │    ────────────────────   ││    ────────────────────   │
  │         Table: tbl        ││         Table: tbl        │
  │                           ││                           │
@@ -198,7 +198,7 @@ EXPLAIN INSERT INTO tbl1 SELECT a.a, a.b, b.b FROM tbl a JOIN tbl b ON a.a = b.a
  │             a             ││             a             │
  │             b             ││             b             │
  │                           ││                           │
- │         ~1270 Rows        ││         ~1270 Rows        │
+ │        ~1,270 rows        ││        ~1,270 rows        │
  └───────────────────────────┘└───────────────────────────┘
  
  

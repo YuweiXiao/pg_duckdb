@@ -9,15 +9,15 @@
 
 namespace pgduckdb {
 
-PostgresCatalog::PostgresCatalog(duckdb::AttachedDatabase &_db, const duckdb::string &connection_string,
-                                 duckdb::AccessMode _access_mode)
-    : Catalog(_db), path(connection_string), access_mode(_access_mode) {
+PostgresCatalog::PostgresCatalog(duckdb::AttachedDatabase &_db, const duckdb::string &connection_string)
+    : Catalog(_db), path(connection_string), schemas() {
 }
 
 duckdb::unique_ptr<duckdb::Catalog>
-PostgresCatalog::Attach(duckdb::StorageExtensionInfo *, duckdb::ClientContext &, duckdb::AttachedDatabase &db,
-                        const duckdb::string &, duckdb::AttachInfo &info, duckdb::AccessMode access_mode) {
-	return duckdb::make_uniq<PostgresCatalog>(db, info.path, access_mode);
+PostgresCatalog::Attach(duckdb::optional_ptr<duckdb::StorageExtensionInfo>, duckdb::ClientContext &,
+                        duckdb::AttachedDatabase &db, const duckdb::string &, duckdb::AttachInfo &info,
+                        duckdb::AttachOptions &) {
+	return duckdb::make_uniq<PostgresCatalog>(db, info.path);
 }
 
 // ------------------ Catalog API ---------------------
@@ -37,10 +37,15 @@ PostgresCatalog::CreateSchema(duckdb::CatalogTransaction, duckdb::CreateSchemaIn
 }
 
 duckdb::optional_ptr<duckdb::SchemaCatalogEntry>
-PostgresCatalog::GetSchema(duckdb::CatalogTransaction catalog_transaction, const duckdb::string &schema_name,
-                           duckdb::OnEntryNotFound, duckdb::QueryErrorContext) {
+PostgresCatalog::LookupSchema(duckdb::CatalogTransaction catalog_transaction,
+                              const duckdb::EntryLookupInfo &schema_lookup, duckdb::OnEntryNotFound) {
 	auto &pg_transaction = catalog_transaction.transaction->Cast<PostgresTransaction>();
-	auto res = pg_transaction.GetCatalogEntry(duckdb::CatalogType::SCHEMA_ENTRY, schema_name, "");
+	const auto catalog_type = schema_lookup.GetCatalogType();
+	if (catalog_type != duckdb::CatalogType::SCHEMA_ENTRY) {
+		throw duckdb::NotImplementedException("LookupSchema only supports SCHEMA_ENTRY");
+	}
+
+	auto res = pg_transaction.GetCatalogEntry(catalog_type, schema_lookup.GetEntryName(), "");
 	D_ASSERT(res);
 	D_ASSERT(res->type == duckdb::CatalogType::SCHEMA_ENTRY);
 	return (duckdb::SchemaCatalogEntry *)res.get();
@@ -50,27 +55,27 @@ void
 PostgresCatalog::ScanSchemas(duckdb::ClientContext &, std::function<void(duckdb::SchemaCatalogEntry &)>) {
 }
 
-duckdb::unique_ptr<duckdb::PhysicalOperator>
-PostgresCatalog::PlanCreateTableAs(duckdb::ClientContext &, duckdb::LogicalCreateTable &,
-                                   duckdb::unique_ptr<duckdb::PhysicalOperator>) {
+duckdb::PhysicalOperator &
+PostgresCatalog::PlanCreateTableAs(duckdb::ClientContext &, duckdb::PhysicalPlanGenerator &,
+                                   duckdb::LogicalCreateTable &, duckdb::PhysicalOperator &) {
 	throw duckdb::NotImplementedException("PlanCreateTableAs not supported yet");
 }
 
-duckdb::unique_ptr<duckdb::PhysicalOperator>
-PostgresCatalog::PlanInsert(duckdb::ClientContext &, duckdb::LogicalInsert &,
-                            duckdb::unique_ptr<duckdb::PhysicalOperator>) {
+duckdb::PhysicalOperator &
+PostgresCatalog::PlanInsert(duckdb::ClientContext &, duckdb::PhysicalPlanGenerator &, duckdb::LogicalInsert &,
+                            duckdb::optional_ptr<duckdb::PhysicalOperator>) {
 	throw duckdb::NotImplementedException("PlanInsert not supported yet");
 }
 
-duckdb::unique_ptr<duckdb::PhysicalOperator>
-PostgresCatalog::PlanDelete(duckdb::ClientContext &, duckdb::LogicalDelete &,
-                            duckdb::unique_ptr<duckdb::PhysicalOperator>) {
+duckdb::PhysicalOperator &
+PostgresCatalog::PlanDelete(duckdb::ClientContext &, duckdb::PhysicalPlanGenerator &, duckdb::LogicalDelete &,
+                            duckdb::PhysicalOperator &) {
 	throw duckdb::NotImplementedException("PlanDelete not supported yet");
 }
 
-duckdb::unique_ptr<duckdb::PhysicalOperator>
-PostgresCatalog::PlanUpdate(duckdb::ClientContext &, duckdb::LogicalUpdate &,
-                            duckdb::unique_ptr<duckdb::PhysicalOperator>) {
+duckdb::PhysicalOperator &
+PostgresCatalog::PlanUpdate(duckdb::ClientContext &, duckdb::PhysicalPlanGenerator &, duckdb::LogicalUpdate &,
+                            duckdb::PhysicalOperator &) {
 	throw duckdb::NotImplementedException("PlanUpdate not supported yet");
 }
 

@@ -108,7 +108,7 @@ SELECT duckdb.raw_query($$ SELECT database_name, schema_name, sql FROM duckdb_ta
 NOTICE:  result: database_name	schema_name	sql	
 VARCHAR	VARCHAR	VARCHAR	
 [ Rows: 2]
-pg_temp	main	CREATE TABLE t(bool BOOLEAN, i2 SMALLINT, i4 INTEGER DEFAULT(1), i8 BIGINT NOT NULL, fl4 FLOAT DEFAULT((random() + CAST(1 AS DOUBLE))), fl8 DOUBLE, t1 VARCHAR, t2 VARCHAR, t3 VARCHAR, d DATE, ts TIMESTAMP, json_obj JSON, CHECK((i4 > i2)), CHECK((fl8 > CAST(0 AS DOUBLE))));
+pg_temp	main	CREATE TABLE t(bool BOOLEAN, i2 SMALLINT, i4 INTEGER DEFAULT(1), i8 BIGINT NOT NULL, fl4 FLOAT DEFAULT((random() + CAST(1 AS "DOUBLE"))), fl8 DOUBLE, t1 VARCHAR, t2 VARCHAR, t3 VARCHAR, d DATE, ts TIMESTAMP, json_obj JSON, CHECK((i4 > i2)), CHECK((fl8 > CAST(0 AS "DOUBLE"))));
 pg_temp	main	CREATE TABLE t2(a INTEGER);
 
 
@@ -163,6 +163,44 @@ CREATE TEMP TABLE t(A text COMPRESSION "pglz");
 ERROR:  Column compression is not supported in DuckDB
 CREATE TEMP TABLE t(a int) WITH (fillfactor = 50);
 ERROR:  Storage options are not supported in DuckDB
+-- Should fail because user should specify the precision of the NUMERIC.
+CREATE TEMP TABLE large_numeric_tbl (a NUMERIC) USING duckdb;
+ERROR:  (PGDuckDB/duckdb_create_table_trigger_cpp) Not implemented Error: Unsupported PostgreSQL type found in query: DuckDB requires the precision of a NUMERIC to be set. You can choose to convert these NUMERICs to a DOUBLE by using 'SET duckdb.convert_unsupported_numeric_to_double = true'
+-- But it's fine if the user specifies the precision
+CREATE TEMP TABLE large_numeric_tbl_specified (a NUMERIC(38,20)) USING duckdb;
+-- CTAS is fine though, it will use duckdb its default
+-- TODO: Maybe make this fail too for consistency?
+CREATE TEMP TABLE duckdb_numeric_from_pg_bare USING duckdb AS select 1::numeric x;
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'duckdb_numeric_from_pg_bare'::regclass AND attname = 'x';
+  format_type  
+---------------
+ numeric(18,3)
+(1 row)
+
+-- Except if they are fully specified
+CREATE TEMP TABLE duckdb_numeric_from_pg USING duckdb AS select 1::numeric(10,8) x;
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'duckdb_numeric_from_pg'::regclass AND attname = 'x';
+  format_type  
+---------------
+ numeric(10,8)
+(1 row)
+
+-- Same when the query is forced by duckdb
+CREATE TEMP TABLE duckdb_numeric_bare USING duckdb AS select * from duckdb.query($$ select 1::numeric x $$);
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'duckdb_numeric_bare'::regclass AND attname = 'x';
+  format_type  
+---------------
+ numeric(18,3)
+(1 row)
+
+-- But CTAS with numerics coming from a duckdb query are fine (i.e. we pass on the precision that duckdb uses)
+CREATE TEMP TABLE duckdb_numeric USING duckdb AS select * from duckdb.query($$ select 1::numeric(10, 5) x $$);
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'duckdb_numeric'::regclass AND attname = 'x';
+  format_type  
+---------------
+ numeric(10,5)
+(1 row)
+
 CREATE TEMP TABLE cities_duckdb (
   name       text,
   population real,
@@ -265,7 +303,12 @@ SELECT atttypid::regtype FROM pg_attribute WHERE attrelid = 't_json'::regclass A
 SELECT duckdb.raw_query($$ SELECT database_name, schema_name, sql FROM duckdb_tables() $$);
 NOTICE:  result: database_name	schema_name	sql	
 VARCHAR	VARCHAR	VARCHAR	
-[ Rows: 3]
+[ Rows: 8]
+pg_temp	main	CREATE TABLE duckdb_numeric(x DECIMAL(10,5));
+pg_temp	main	CREATE TABLE duckdb_numeric_bare(x DECIMAL(18,3));
+pg_temp	main	CREATE TABLE duckdb_numeric_from_pg(x DECIMAL(10,8));
+pg_temp	main	CREATE TABLE duckdb_numeric_from_pg_bare(x DECIMAL(18,3));
+pg_temp	main	CREATE TABLE large_numeric_tbl_specified(a DECIMAL(38,20));
 pg_temp	main	CREATE TABLE t(b INTEGER);
 pg_temp	main	CREATE TABLE t_json("data" JSON);
 pg_temp	main	CREATE TABLE webpages(column00 BIGINT, column01 VARCHAR, column02 DATE);
@@ -428,7 +471,7 @@ EXPLAIN VERBOSE INSERT INTO tc(c) SELECT md5('ta');
                          QUERY PLAN                         
 ------------------------------------------------------------
  Custom Scan (DuckDBScan)  (cost=0.00..0.00 rows=0 width=0)
-   Output: duckdb_scan."Count"
+   Output: "Count"
    DuckDB Execution Plan: 
  
  ┌───────────────────────────┐
@@ -437,23 +480,35 @@ EXPLAIN VERBOSE INSERT INTO tc(c) SELECT md5('ta');
  ┌─────────────┴─────────────┐
  │         PROJECTION        │
  │    ────────────────────   │
+ │     CAST(3 AS INTEGER)    │
+ │            NULL           │
+ │             #0            │
+ │  (CAST('a' AS VARCHAR) || │
+ │    CAST('b' AS VARCHAR))  │
+ │          (1 + 2)          │
+ │                           │
+ │           ~1 row          │
+ └─────────────┬─────────────┘
+ ┌─────────────┴─────────────┐
+ │         PROJECTION        │
+ │    ────────────────────   │
  │            md5            │
  │                           │
- │          ~1 Rows          │
+ │           ~1 row          │
  └─────────────┬─────────────┘
  ┌─────────────┴─────────────┐
  │         DUMMY_SCAN        │
  └───────────────────────────┘
  
  
-(19 rows)
+(31 rows)
 
 INSERT INTO tc(c) SELECT md5('ta');
 EXPLAIN VERBOSE INSERT INTO tc(d) SELECT md5('test');
                          QUERY PLAN                         
 ------------------------------------------------------------
  Custom Scan (DuckDBScan)  (cost=0.00..0.00 rows=0 width=0)
-   Output: duckdb_scan."Count"
+   Output: "Count"
    DuckDB Execution Plan: 
  
  ┌───────────────────────────┐
@@ -462,16 +517,28 @@ EXPLAIN VERBOSE INSERT INTO tc(d) SELECT md5('test');
  ┌─────────────┴─────────────┐
  │         PROJECTION        │
  │    ────────────────────   │
+ │     CAST(3 AS INTEGER)    │
+ │            NULL           │
+ │    CAST('pg_duckdb' AS    │
+ │          VARCHAR)         │
+ │             #0            │
+ │          (1 + 2)          │
+ │                           │
+ │           ~1 row          │
+ └─────────────┬─────────────┘
+ ┌─────────────┴─────────────┐
+ │         PROJECTION        │
+ │    ────────────────────   │
  │            md5            │
  │                           │
- │          ~1 Rows          │
+ │           ~1 row          │
  └─────────────┬─────────────┘
  ┌─────────────┴─────────────┐
  │         DUMMY_SCAN        │
  └───────────────────────────┘
  
  
-(19 rows)
+(31 rows)
 
 INSERT INTO tc(d) SELECT md5('test');
 SELECT * FROM tc;
@@ -484,7 +551,7 @@ SELECT * FROM tc;
 -- Set Returning Function
 TRUNCATE TABLE ta;
 INSERT INTO ta (a) SELECT generate_series(1, 3); -- failed. DuckDB expects this "INSERT INTO ta (a) FROM generate_series(1, 3)"
-ERROR:  (PGDuckDB/Duckdb_ExecCustomScan_Cpp) Conversion Error: Unimplemented type for cast (BIGINT[] -> INTEGER)
+ERROR:  (PGDuckDB/Duckdb_ExecCustomScan_Cpp) Conversion Error: Unimplemented type for cast (BIGINT[] -> INTEGER) when casting from source column generate_series
 
 LINE 1:  INSERT INTO pg_temp.main.ta (a) SELECT generate_series(1, 3) AS generate_series
                                                 ^
@@ -525,4 +592,14 @@ SELECT * FROM ta;
  3 | 3 |     | 
 (6 rows)
 
-DROP TABLE webpages, t, t_heap, t_heap2, t_heap3, ta, tb, tc, td;
+CREATE TEMP TABLE measurement (
+    city_id         int not null,
+    logdate         date not null,
+    peaktemp        int,
+    unitsales       int
+) PARTITION BY RANGE (logdate);
+-- This command should fail because we don't support duckdb partitions yet
+CREATE TEMP TABLE measurement_y2006m02 PARTITION OF measurement
+    FOR VALUES FROM ('2006-02-01') TO ('2006-03-01') USING duckdb;
+ERROR:  DuckDB tables cannot be used as a partition
+DROP TABLE webpages, t, t_heap, t_heap2, t_heap3, ta, tb, tc, td, measurement;

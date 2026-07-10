@@ -43,17 +43,13 @@ struct {
 bool callback_is_configured = false;
 
 void
-InvalidateDuckDBSecrets() {
-	auto manager = pgduckdb::DuckDBManager::FindIfInitialized();
-	if (manager) {
-		manager->InvalidateDuckDBSecrets();
-	}
-}
-
-void
+#if PG_VERSION_NUM >= 190000
+InvalidateCache(Datum, SysCacheIdentifier, uint32) {
+#else
 InvalidateCache(Datum, int, uint32) {
+#endif
 	InvalidateUserDataCache();
-	InvokeCPPFunc(InvalidateDuckDBSecrets);
+	InvokeCPPFunc(pgduckdb::DuckDBManager::InvalidateDuckDBSecretsIfInitialized);
 }
 
 } // namespace
@@ -71,7 +67,7 @@ InvalidateUserDataCache() {
 	cache.motherduck_user_mapping_oid = InvalidOid;
 }
 
-void
+static void
 LoadMotherDuckCache() {
 	Assert(!cache.valid); // shouldn't be called if the cache is already valid
 
@@ -118,9 +114,14 @@ IsMotherDuckEnabled() {
 }
 
 Oid
-MotherDuckPostgresUser() {
+MotherDuckPostgresUserOid() {
 	Assert(cache.valid);
 	return cache.motherduck_postgres_role_oid;
+}
+
+char *
+MotherDuckPostgresUserName() {
+	return GetUserNameFromId(MotherDuckPostgresUserOid(), false);
 }
 
 Oid

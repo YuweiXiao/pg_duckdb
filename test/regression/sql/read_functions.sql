@@ -40,7 +40,7 @@ SELECT * FROM (
 ) q;
 
 -- NOTE: A single "r" is equivalent to a *. The prefix and postfix columns are
--- not explicitely selected, but still show up in the result. This is
+-- not explicitly selected, but still show up in the result. This is
 -- considered a bug, but it's one that we cannot easily solve because the "r"
 -- reference does not exist in the DuckDB query at all, so there's no way to
 -- reference only the columns coming from that part of the subquery. Very few
@@ -190,6 +190,15 @@ select * from experiences;
 -- We show a hint for the new syntax when someone uses the old syntax.
 SELECT count("sepal.length") FROM read_parquet('../../data/iris.parquet') AS ("sepal.length" FLOAT);
 
+-- But we don't show that hint for queries that don't use these functions.
+SELECT count("sepal.length") FROM generate_series(1, 100) AS ("sepal.length" FLOAT);
+
+-- Show a hint for users trying to use columns as normal instead of using r['column_name']
+SELECT count("sepal.length") FROM read_parquet('../../data/iris.parquet');
+
+-- But again only show it when we use functions that return duckdb.rows
+SELECT count("sepal.length") FROM generate_series(1, 100) a(x);
+
 -- read_csv
 
 SELECT count(r['sepal.length']) FROM read_csv('../../data/iris.csv') r;
@@ -268,7 +277,7 @@ WHERE
 	AND r['l_quantity'] < 25
 LIMIT 1;
 
-SELECT * FROM iceberg_snapshots('../../data/lineitem_iceberg');
+SELECT * FROM iceberg_snapshots('../../data/lineitem_iceberg') ORDER BY sequence_number;
 SELECT * FROM iceberg_metadata('../../data/lineitem_iceberg',  allow_moved_paths => true);
 
 -- read_json
@@ -276,3 +285,32 @@ SELECT * FROM iceberg_metadata('../../data/lineitem_iceberg',  allow_moved_paths
 SELECT COUNT(r['a']) FROM read_json('../../data/table.json') r;
 SELECT COUNT(r['a']) FROM read_json('../../data/table.json') r WHERE r['c'] > 50.4;
 SELECT r['a'], r['b'], r['c'] FROM read_json('../../data/table.json') r WHERE r['c'] > 50.4 AND r['c'] < 51.2;
+
+-- read_vortex
+
+SELECT duckdb.install_extension('vortex');
+
+SELECT count(r['sepal.length']) FROM read_vortex('../../data/iris.vortex') r;
+
+SELECT r['sepal.length'] FROM read_vortex('../../data/iris.vortex') r ORDER BY r['sepal.length']  LIMIT 5;
+
+-- array of paths
+SELECT count(*) FROM read_vortex(ARRAY['../../data/iris.vortex', '../../data/iris.vortex']) r;
+
+-- read_text
+
+SELECT r['size'] FROM read_text('../../data/table.json') r;
+
+SELECT length(r['content']) FROM read_text('../../data/table.json') r;
+
+-- array of paths
+SELECT count(*) FROM read_text(ARRAY['../../data/table.json', '../../data/table.json']) r;
+
+-- read_blob
+
+SELECT r['size'] FROM read_blob('../../data/table.json') r;
+
+SELECT octet_length(r['content']::bytea) FROM read_blob('../../data/table.json') r;
+
+-- array of paths
+SELECT count(*) FROM read_blob(ARRAY['../../data/table.json']) r;

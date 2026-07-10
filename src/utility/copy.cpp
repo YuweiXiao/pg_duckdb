@@ -2,7 +2,7 @@
 
 #include <inttypes.h>
 
-#include "pgduckdb/pgduckdb_guc.h"
+#include "pgduckdb/pgduckdb_guc.hpp"
 #include "pgduckdb/pgduckdb_metadata_cache.hpp"
 #include "pgduckdb/pgduckdb_hooks.hpp"
 
@@ -28,10 +28,6 @@ extern "C" {
 #include "pgduckdb/vendor/pg_list.hpp"
 #include "pgduckdb/pgduckdb_ruleutils.h"
 }
-
-static constexpr char s3_filename_prefix[] = "s3://";
-static constexpr char gcs_filename_prefix[] = "gs://";
-static constexpr char r2_filename_prefix[] = "r2://";
 
 /*
  * Returns the relation of the copy_stmt as a fully qualified DuckDB table reference. This is done
@@ -59,16 +55,6 @@ AppendCreateRelationCopyString(StringInfo info, ParseState *pstate, CopyStmt *co
 #endif
 
 	table_close(rel, AccessShareLock);
-
-	/*
-	 * RLS for relation. We should probably bail out at this point.
-	 */
-	if (check_enable_rls(relid, InvalidOid, false) == RLS_ENABLED) {
-		ereport(ERROR,
-		        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-		         errmsg("(PGDuckDB/CreateRelationCopyString) RLS enabled on \"%s\", cannot use DuckDB based COPY",
-		                RelationGetRelationName(rel))));
-	}
 
 	appendStringInfoString(info, pgduckdb_relation_name(relid));
 	if (!copy_stmt->attlist) {
@@ -99,12 +85,21 @@ AppendCreateRelationCopyString(StringInfo info, ParseState *pstate, CopyStmt *co
  * Checks if postgres permissions permit us to execute this query as the
  * current user.
  */
-void
+static void
 CheckQueryPermissions(Query *query, const char *query_string) {
 	Query *copied_query = (Query *)copyObjectImpl(query);
 
 	/* First we let postgres plan the query */
+#if PG_VERSION_NUM >= 190000
+	PlannedStmt *postgres_plan = pg_plan_query(copied_query, query_string, CURSOR_OPT_PARALLEL_OK, NULL, NULL);
+#else
 	PlannedStmt *postgres_plan = pg_plan_query(copied_query, query_string, CURSOR_OPT_PARALLEL_OK, NULL);
+#endif
+
+	if (postgres_plan == nullptr) {
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+		                errmsg("(PGDuckDB/CheckQueryPermissions) Used query in COPY that could not be planned")));
+	}
 
 #if PG_VERSION_NUM >= 160000
 	ExecCheckPermissions(postgres_plan->rtable, postgres_plan->permInfos, true);
@@ -234,6 +229,27 @@ StringOneOfInternal(const char *str, const char *compare_to[], int length_of_com
 	return false;
 }
 
+static bool
+MatchesURIScheme(const char *str) {
+	if (str == NULL) {
+		return false;
+	}
+
+	const char *p = str;
+
+	// First character must be a letter
+	if (!isalpha(*p))
+		return false;
+	p++;
+
+	// Continue with alphanumeric
+	while (*p && (isalnum(*p)))
+		p++;
+
+	// Must be followed by ://
+	return (strncmp(p, "://", 3) == 0);
+}
+
 #define StringOneOf(str, compare_to) StringOneOfInternal(str, compare_to, lengthof(compare_to))
 
 static bool
@@ -258,6 +274,11 @@ IsAllowedStatement(CopyStmt *stmt, bool throw_error = false) {
 
 	if (stmt->filename == NULL) {
 		elog(elevel, "COPY ... TO STDOUT/FROM STDIN is not supported by DuckDB");
+		return false;
+	}
+
+	if (!stmt->is_from && !is_absolute_path(stmt->filename) && !MatchesURIScheme(stmt->filename)) {
+		ereport(elevel, (errcode(ERRCODE_INVALID_NAME), errmsg("relative path not allowed for COPY to file")));
 		return false;
 	}
 
@@ -307,10 +328,15 @@ static bool
 NeedsDuckdbExecution(CopyStmt *stmt) {
 	/* Copy `filename` should start with S3/GS/R2 prefix */
 	if (stmt->filename != NULL) {
-		if (CheckPrefix(stmt->filename, s3_filename_prefix) || CheckPrefix(stmt->filename, gcs_filename_prefix) ||
-		    CheckPrefix(stmt->filename, r2_filename_prefix)) {
+		if (CheckPrefix(stmt->filename, "s3://") || CheckPrefix(stmt->filename, "r2://") ||
+		    CheckPrefix(stmt->filename, "gcs://") || CheckPrefix(stmt->filename, "gs://") ||
+		    CheckPrefix(stmt->filename, "http://") || CheckPrefix(stmt->filename, "https://") ||
+		    CheckPrefix(stmt->filename, "az://") || CheckPrefix(stmt->filename, "azure://") ||
+		    CheckPrefix(stmt->filename, "abfs://") || CheckPrefix(stmt->filename, "abfss://")) {
+
 			return true;
 		}
+
 		if (pg_str_endswith(stmt->filename, ".parquet") || pg_str_endswith(stmt->filename, ".json") ||
 		    pg_str_endswith(stmt->filename, ".ndjson") || pg_str_endswith(stmt->filename, ".jsonl") ||
 		    pg_str_endswith(stmt->filename, ".gz") || pg_str_endswith(stmt->filename, ".zst")) {
@@ -344,10 +370,11 @@ NeedsDuckdbExecution(CopyStmt *stmt) {
 const char *
 MakeDuckdbCopyQuery(PlannedStmt *pstmt, const char *query_string, struct QueryEnvironment *query_env) {
 	CopyStmt *copy_stmt = (CopyStmt *)pstmt->utilityStmt;
+	bool needs_duckdb_execution = NeedsDuckdbExecution(copy_stmt);
 
-	if (NeedsDuckdbExecution(copy_stmt)) {
+	if (needs_duckdb_execution) {
 		IsAllowedStatement(copy_stmt, true);
-	} else if (!duckdb_force_execution || !IsAllowedStatement(copy_stmt)) {
+	} else if (!pgduckdb::duckdb_force_execution || !IsAllowedStatement(copy_stmt)) {
 		if (copy_stmt->relation && !copy_stmt->is_from) {
 			/*
 			 * We don't support enough of the table access method API to allow
@@ -377,7 +404,7 @@ MakeDuckdbCopyQuery(PlannedStmt *pstmt, const char *query_string, struct QueryEn
 	appendStringInfo(rewritten_query_info, "COPY ");
 	if (copy_stmt->query) {
 		RawStmt *raw_stmt = makeNode(RawStmt);
-		raw_stmt->stmt = copy_stmt->query;
+		raw_stmt->stmt = (Node *)copyObjectImpl(copy_stmt->query);
 		raw_stmt->stmt_location = pstmt->stmt_location;
 		raw_stmt->stmt_len = pstmt->stmt_len;
 
@@ -389,8 +416,20 @@ MakeDuckdbCopyQuery(PlannedStmt *pstmt, const char *query_string, struct QueryEn
 		CheckRewritten(rewritten);
 
 		Query *query = linitial_node(Query, rewritten);
+
+		if (needs_duckdb_execution) {
+			pgduckdb::IsAllowedStatement(query, true);
+		} else if (!pgduckdb::IsAllowedStatement(query, false) || query->commandType != CMD_SELECT) {
+			/* We don't need to do anything */
+			return nullptr;
+		}
+
+		if (query->commandType != CMD_SELECT) {
+			ereport(ERROR,
+			        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("DuckDB COPY only supports SELECT statements")));
+		}
+
 		CheckQueryPermissions(query, query_string);
-		pgduckdb::IsAllowedStatement(query, true);
 
 		appendStringInfo(rewritten_query_info, "(");
 		appendStringInfoString(rewritten_query_info, pgduckdb_get_querydef(query));

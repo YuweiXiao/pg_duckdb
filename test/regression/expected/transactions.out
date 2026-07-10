@@ -1,5 +1,6 @@
 -- For this test we duckdb set execution to false
 SET duckdb.force_execution = false;
+SET duckdb.unsafe_allow_execution_inside_functions = true;
 CREATE TABLE t(a int);
 INSERT INTO t VALUES (1);
 CREATE TEMP TABLE t_ddb(a int) USING duckdb;
@@ -51,7 +52,7 @@ INSERT INTO t VALUES (2);
 INSERT INTO t_ddb VALUES (2);
 ERROR:  (PGDuckDB/DuckdbExecutorStartHook_Cpp) Not implemented Error: Writing to DuckDB and Postgres tables in the same transaction block is not supported
 ROLLBACK;
--- Unless users explicitely opt-in
+-- Unless users explicitly opt-in
 BEGIN;
 SET LOCAL duckdb.unsafe_allow_mixed_transactions = true;
 INSERT INTO t_ddb VALUES (4);
@@ -117,9 +118,8 @@ $$;
 -- After executing the function the table should not contain the value 8,
 -- because that change was rolled back
 SELECT * FROM f(true);
-ERROR:  DuckDB execution is not supported inside functions
-CONTEXT:  SQL statement "INSERT INTO t_ddb VALUES (8)"
-PL/pgSQL function f(boolean) line 3 at SQL statement
+ERROR:  fail
+CONTEXT:  PL/pgSQL function f(boolean) line 5 at RAISE
 SELECT * FROM t_ddb ORDER BY a;
  a 
 ---
@@ -136,9 +136,11 @@ SELECT * FROM t_ddb ORDER BY a;
 
 -- But if the function succeeds we should see the new value
 SELECT * FROM f(false);
-ERROR:  DuckDB execution is not supported inside functions
-CONTEXT:  SQL statement "INSERT INTO t_ddb VALUES (8)"
-PL/pgSQL function f(boolean) line 3 at SQL statement
+ f 
+---
+ 
+(1 row)
+
 SELECT * FROM t_ddb ORDER BY a;
  a 
 ---
@@ -151,7 +153,8 @@ SELECT * FROM t_ddb ORDER BY a;
  5
  5
  6
-(9 rows)
+ 8
+(10 rows)
 
 -- DuckDB DDL in transactions is allowed
 BEGIN;
@@ -191,11 +194,12 @@ BEGIN
 END;
 $$;
 SELECT * FROM f2();
-ERROR:  DuckDB execution is not supported inside functions
-CONTEXT:  SQL statement "CREATE TEMP TABLE t_ddb3(a) USING duckdb AS SELECT 1"
-PL/pgSQL function f2() line 4 at SQL statement
+ f2 
+----
+ 
+(1 row)
+
 DROP TABLE t_ddb4;
-ERROR:  table "t_ddb4" does not exist
 -- ...unless there's also PG only changes happing in the same transaction (no matter the order of statements).
 BEGIN;
     CREATE TABLE t_x(a int);
@@ -324,7 +328,7 @@ NOTICE:  table "t_doesnotexist" does not exist, skipping
 END;
 CREATE TEMP TABLE t_ddb(a int) USING duckdb;
 -- It should also not be allowed to drop duckdb and postgres tables in the same
--- transaction if it's implicitely done using a DROP SCHEMA ... CASCADE.
+-- transaction if it's implicitly done using a DROP SCHEMA ... CASCADE.
 CREATE SCHEMA mixed;
 CREATE TEMP TABLE t_ddb2(a int) USING duckdb;
 -- Insert a row into pg_depend to make t_ddb depend on the mixed schema. We do
@@ -338,7 +342,7 @@ INSERT INTO pg_depend(classid, objid, objsubid, refclassid, refobjid, refobjsubi
 BEGIN;
     DROP SCHEMA mixed CASCADE;
 NOTICE:  drop cascades to table t_ddb2
-ERROR:  Dropping both DuckDB tables and non-DuckDB objects in the same transaction is not supported
+ERROR:  Dropping both DuckDB relations and non-DuckDB objects in the same transaction is not supported
 END;
 -- We have a special message for tables
 CREATE TABLE mixed.t(a int);
@@ -347,7 +351,7 @@ BEGIN;
 NOTICE:  drop cascades to 2 other objects
 DETAIL:  drop cascades to table t_ddb2
 drop cascades to table mixed.t
-ERROR:  Dropping both DuckDB and non-DuckDB tables in the same transaction is not supported
+ERROR:  Dropping both DuckDB and non-DuckDB relations in the same transaction is not supported
 END;
 -- It should work outside of a transaction though.
 DROP SCHEMA mixed CASCADE;

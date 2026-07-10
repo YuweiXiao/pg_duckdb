@@ -1,9 +1,10 @@
 import os
-import pytest
-import psycopg.errors
 
-from .utils import Postgres, Duckdb, create_duckdb
+import psycopg.errors
+import pytest
+
 from .motherduck_token_helper import create_test_user
+from .utils import Duckdb, Postgres, make_new_duckdb_connection
 
 
 @pytest.fixture(scope="session")
@@ -71,12 +72,12 @@ def pg(initialized_shared_pg, default_db_name):
                 # there's no indictaion of the crash except for the logs. So
                 # here we check that postgres did not crash during the last
                 # test.
-                assert (
-                    "was terminated by signal 6" not in logs
-                ), "Postgres crashed! Check the logs above."
-                assert (
-                    "was terminated by signal 11" not in logs
-                ), "Postgres crashed! Check the logs above."
+                assert "was terminated by signal 6" not in logs, (
+                    "Postgres crashed! Check the logs above."
+                )
+                assert "was terminated by signal 11" not in logs, (
+                    "Postgres crashed! Check the logs above."
+                )
 
 
 @pytest.fixture
@@ -145,7 +146,7 @@ def md_cur(pg, default_db_name, ddb, md_test_user):
 
     pg.search_path = f"ddb${default_db_name}, public"
     with pg.cur() as cur:
-        cur.wait_until_schema_exists(f"ddb${default_db_name}")
+        cur.wait_until_schema_exists(f"ddb${default_db_name}", timeout=60)
         yield cur
 
 
@@ -155,7 +156,7 @@ def ddb(default_db_name, md_test_user):
 
     This also creates a database for the test to use.
     """
-    ddb_con = create_duckdb(default_db_name, md_test_user["token"])
+    ddb_con = make_new_duckdb_connection(default_db_name, md_test_user["token"])
 
     try:
         yield Duckdb(ddb_con)

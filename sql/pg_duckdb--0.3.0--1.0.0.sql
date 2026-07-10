@@ -1,6 +1,40 @@
+-- Move internal functions that are outside of the duckdb schema to the duckdb schema
+ALTER FUNCTION duckdb_unresolved_type_operator(duckdb.unresolved_type, "any") SET SCHEMA duckdb;
+ALTER FUNCTION duckdb_unresolved_type_operator_bool(duckdb.unresolved_type, "any") SET SCHEMA duckdb;
+ALTER FUNCTION duckdb_unresolved_type_operator("any", duckdb.unresolved_type) SET SCHEMA duckdb;
+ALTER FUNCTION duckdb_unresolved_type_operator_bool("any", duckdb.unresolved_type) SET SCHEMA duckdb;
+ALTER FUNCTION duckdb_unresolved_type_operator(duckdb.unresolved_type, duckdb.unresolved_type) SET SCHEMA duckdb;
+ALTER FUNCTION duckdb_unresolved_type_operator_bool(duckdb.unresolved_type, duckdb.unresolved_type) SET SCHEMA duckdb;
+ALTER FUNCTION duckdb_unresolved_type_operator(duckdb.unresolved_type) SET SCHEMA duckdb;
+ALTER FUNCTION duckdb_unresolved_type_state_trans(state duckdb.unresolved_type, value duckdb.unresolved_type) SET SCHEMA duckdb;
+ALTER FUNCTION duckdb_unresolved_type_state_trans(state duckdb.unresolved_type, value duckdb.unresolved_type, other "any") SET SCHEMA duckdb;
+ALTER FUNCTION duckdb_unresolved_type_state_trans(state duckdb.unresolved_type, value duckdb.unresolved_type, other "any", another "any") SET SCHEMA duckdb;
+ALTER FUNCTION duckdb_unresolved_type_final(state duckdb.unresolved_type) SET SCHEMA duckdb;
+ALTER FUNCTION duckdb_unresolved_type_btree_cmp(duckdb.unresolved_type,duckdb.unresolved_type) SET SCHEMA duckdb;
+ALTER FUNCTION duckdb_unresolved_type_hash(duckdb.unresolved_type) SET SCHEMA duckdb;
+ALTER OPERATOR CLASS duckdb_unresolved_type_ops USING btree SET SCHEMA duckdb;
+ALTER OPERATOR CLASS duckdb_unresolved_type_hash_ops USING hash SET SCHEMA duckdb;
+
+ALTER FUNCTION duckdb.duckdb_unresolved_type_operator(duckdb.unresolved_type, "any") RENAME TO unresolved_type_operator;
+ALTER FUNCTION duckdb.duckdb_unresolved_type_operator_bool(duckdb.unresolved_type, "any") RENAME TO unresolved_type_operator_bool;
+ALTER FUNCTION duckdb.duckdb_unresolved_type_operator("any", duckdb.unresolved_type) RENAME TO unresolved_type_operator;
+ALTER FUNCTION duckdb.duckdb_unresolved_type_operator_bool("any", duckdb.unresolved_type) RENAME TO unresolved_type_operator_bool;
+ALTER FUNCTION duckdb.duckdb_unresolved_type_operator(duckdb.unresolved_type, duckdb.unresolved_type) RENAME TO unresolved_type_operator;
+ALTER FUNCTION duckdb.duckdb_unresolved_type_operator_bool(duckdb.unresolved_type, duckdb.unresolved_type) RENAME TO unresolved_type_operator_bool;
+ALTER FUNCTION duckdb.duckdb_unresolved_type_operator(duckdb.unresolved_type) RENAME TO unresolved_type_operator;
+ALTER FUNCTION duckdb.duckdb_unresolved_type_state_trans(state duckdb.unresolved_type, value duckdb.unresolved_type) RENAME TO unresolved_type_state_trans;
+ALTER FUNCTION duckdb.duckdb_unresolved_type_state_trans(state duckdb.unresolved_type, value duckdb.unresolved_type, other "any") RENAME TO unresolved_type_state_trans;
+ALTER FUNCTION duckdb.duckdb_unresolved_type_state_trans(state duckdb.unresolved_type, value duckdb.unresolved_type, other "any", another "any") RENAME TO unresolved_type_state_trans;
+ALTER FUNCTION duckdb.duckdb_unresolved_type_final(state duckdb.unresolved_type) RENAME TO unresolved_type_final;
+ALTER FUNCTION duckdb.duckdb_unresolved_type_btree_cmp(duckdb.unresolved_type,duckdb.unresolved_type) RENAME TO unresolved_type_btree_cmp;
+ALTER FUNCTION duckdb.duckdb_unresolved_type_hash(duckdb.unresolved_type) RENAME TO unresolved_type_hash;
+ALTER OPERATOR CLASS duckdb.duckdb_unresolved_type_ops USING btree RENAME TO unresolved_type_ops;
+ALTER OPERATOR CLASS duckdb.duckdb_unresolved_type_hash_ops USING hash RENAME TO unresolved_type_hash_ops;
+
 -- Ensure UTF8 encoding
 DO $$
 BEGIN
+    SET LOCAL search_path = pg_catalog, pg_temp;
     IF current_setting('server_encoding') != 'UTF8' THEN
         RAISE EXCEPTION 'pg_duckdb can only be installed in a Postgres database with UTF8 encoding, this one is encoded using %.', current_setting('server_encoding');
     END IF;
@@ -64,15 +98,32 @@ LANGUAGE C;
 
 DROP FUNCTION duckdb.install_extension(TEXT);
 CREATE FUNCTION duckdb.install_extension(extension_name TEXT, source TEXT DEFAULT 'core') RETURNS void
+    SECURITY DEFINER
     SET search_path = pg_catalog, pg_temp
+    SET duckdb.force_execution = false
     LANGUAGE C AS 'MODULE_PATHNAME', 'install_extension';
 REVOKE ALL ON FUNCTION duckdb.install_extension(TEXT, TEXT) FROM PUBLIC;
 
+CREATE FUNCTION duckdb.autoload_extension(extension_name TEXT, autoload BOOLEAN DEFAULT TRUE) RETURNS void
+    SECURITY DEFINER
+    SET search_path = pg_catalog, pg_temp
+    SET duckdb.force_execution = false
+    LANGUAGE C AS 'MODULE_PATHNAME', 'duckdb_autoload_extension';
+REVOKE ALL ON FUNCTION duckdb.autoload_extension(TEXT, BOOLEAN) FROM PUBLIC;
+
+CREATE FUNCTION duckdb.load_extension(extension_name TEXT) RETURNS void
+    SET search_path = pg_catalog, pg_temp
+    SET duckdb.force_execution = false
+    LANGUAGE C AS 'MODULE_PATHNAME', 'duckdb_load_extension';
+-- load_extension is allowed for all users, because it is trivial for users run
+-- a raw query that does the same. This function only exists for completeness
+-- and convenience.
+
 -- The min aggregate was somehow missing from the list of aggregates in 0.3.0
 CREATE AGGREGATE @extschema@.min(duckdb.unresolved_type) (
-    SFUNC = duckdb_unresolved_type_state_trans,
+    SFUNC = duckdb.unresolved_type_state_trans,
     STYPE = duckdb.unresolved_type,
-    FINALFUNC = duckdb_unresolved_type_final
+    FINALFUNC = duckdb.unresolved_type_final
 );
 
 CREATE FUNCTION @extschema@.strftime(date, text) RETURNS text
@@ -256,6 +307,26 @@ AS 'MODULE_PATHNAME', 'duckdb_only_function'
 LANGUAGE C;
 
 CREATE FUNCTION @extschema@.epoch_ns(duckdb.unresolved_type) RETURNS bigint
+SET search_path = pg_catalog, pg_temp
+AS 'MODULE_PATHNAME', 'duckdb_only_function'
+LANGUAGE C;
+
+CREATE FUNCTION @extschema@.make_timestamp(microseconds bigint) RETURNS timestamp
+SET search_path = pg_catalog, pg_temp
+AS 'MODULE_PATHNAME', 'duckdb_only_function'
+LANGUAGE C;
+
+CREATE FUNCTION @extschema@.make_timestamp(microseconds duckdb.unresolved_type) RETURNS timestamp
+SET search_path = pg_catalog, pg_temp
+AS 'MODULE_PATHNAME', 'duckdb_only_function'
+LANGUAGE C;
+
+CREATE FUNCTION @extschema@.make_timestamptz(microseconds bigint) RETURNS timestamptz
+SET search_path = pg_catalog, pg_temp
+AS 'MODULE_PATHNAME', 'duckdb_only_function'
+LANGUAGE C;
+
+CREATE FUNCTION @extschema@.make_timestamptz(microseconds duckdb.unresolved_type) RETURNS timestamptz
 SET search_path = pg_catalog, pg_temp
 AS 'MODULE_PATHNAME', 'duckdb_only_function'
 LANGUAGE C;
@@ -516,112 +587,117 @@ CREATE CAST (duckdb.unresolved_type AS bytea)
 CREATE CAST (duckdb.unresolved_type AS bytea[])
     WITH INOUT;
 
+CREATE CAST (duckdb.unresolved_type AS text)
+    WITH INOUT;
+CREATE CAST (duckdb.unresolved_type AS text[])
+    WITH INOUT;
+
 CREATE OPERATOR pg_catalog.~ (
     LEFTARG = duckdb.unresolved_type,
     RIGHTARG = duckdb.unresolved_type,
-    FUNCTION = duckdb_unresolved_type_operator
+    FUNCTION = duckdb.unresolved_type_operator
 );
 
 CREATE OPERATOR pg_catalog.~ (
     LEFTARG = duckdb.unresolved_type,
     RIGHTARG = "any",
-    FUNCTION = duckdb_unresolved_type_operator
+    FUNCTION = duckdb.unresolved_type_operator
 );
 
 CREATE OPERATOR pg_catalog.~ (
     LEFTARG = "any",
     RIGHTARG = duckdb.unresolved_type,
-    FUNCTION = duckdb_unresolved_type_operator
+    FUNCTION = duckdb.unresolved_type_operator
 );
 
 CREATE OPERATOR pg_catalog.!~ (
     LEFTARG = duckdb.unresolved_type,
     RIGHTARG = duckdb.unresolved_type,
-    FUNCTION = duckdb_unresolved_type_operator
+    FUNCTION = duckdb.unresolved_type_operator
 );
 
 CREATE OPERATOR pg_catalog.!~ (
     LEFTARG = duckdb.unresolved_type,
     RIGHTARG = "any",
-    FUNCTION = duckdb_unresolved_type_operator
+    FUNCTION = duckdb.unresolved_type_operator
 );
 
 CREATE OPERATOR pg_catalog.!~ (
     LEFTARG = "any",
     RIGHTARG = duckdb.unresolved_type,
-    FUNCTION = duckdb_unresolved_type_operator
+    FUNCTION = duckdb.unresolved_type_operator
 );
 
 CREATE OPERATOR pg_catalog.~~ (
     LEFTARG = duckdb.unresolved_type,
     RIGHTARG = duckdb.unresolved_type,
-    FUNCTION = duckdb_unresolved_type_operator
+    FUNCTION = duckdb.unresolved_type_operator
 );
 
 CREATE OPERATOR pg_catalog.~~ (
     LEFTARG = duckdb.unresolved_type,
     RIGHTARG = "any",
-    FUNCTION = duckdb_unresolved_type_operator
+    FUNCTION = duckdb.unresolved_type_operator
 );
 
 CREATE OPERATOR pg_catalog.~~ (
     LEFTARG = "any",
     RIGHTARG = duckdb.unresolved_type,
-    FUNCTION = duckdb_unresolved_type_operator
+    FUNCTION = duckdb.unresolved_type_operator
 );
 
 CREATE OPERATOR pg_catalog.~~* (
     LEFTARG = duckdb.unresolved_type,
     RIGHTARG = duckdb.unresolved_type,
-    FUNCTION = duckdb_unresolved_type_operator
+    FUNCTION = duckdb.unresolved_type_operator
 );
 
 CREATE OPERATOR pg_catalog.~~* (
     LEFTARG = duckdb.unresolved_type,
     RIGHTARG = "any",
-    FUNCTION = duckdb_unresolved_type_operator
+    FUNCTION = duckdb.unresolved_type_operator
 );
 
 CREATE OPERATOR pg_catalog.~~* (
     LEFTARG = "any",
     RIGHTARG = duckdb.unresolved_type,
-    FUNCTION = duckdb_unresolved_type_operator
+    FUNCTION = duckdb.unresolved_type_operator
 );
 
 CREATE OPERATOR pg_catalog.!~~ (
     LEFTARG = duckdb.unresolved_type,
     RIGHTARG = duckdb.unresolved_type,
-    FUNCTION = duckdb_unresolved_type_operator
+    FUNCTION = duckdb.unresolved_type_operator
 );
 
 CREATE OPERATOR pg_catalog.!~~ (
     LEFTARG = duckdb.unresolved_type,
     RIGHTARG = "any",
-    FUNCTION = duckdb_unresolved_type_operator
+    FUNCTION = duckdb.unresolved_type_operator
 );
 
 CREATE OPERATOR pg_catalog.!~~ (
     LEFTARG = "any",
     RIGHTARG = duckdb.unresolved_type,
-    FUNCTION = duckdb_unresolved_type_operator
+    FUNCTION = duckdb.unresolved_type_operator
 );
 
 CREATE OPERATOR pg_catalog.!~~* (
     LEFTARG = duckdb.unresolved_type,
     RIGHTARG = duckdb.unresolved_type,
-    FUNCTION = duckdb_unresolved_type_operator
+    FUNCTION = duckdb.unresolved_type_operator
 );
 
 CREATE OPERATOR pg_catalog.!~~* (
     LEFTARG = duckdb.unresolved_type,
     RIGHTARG = "any",
-    FUNCTION = duckdb_unresolved_type_operator
+    FUNCTION = duckdb.unresolved_type_operator
 );
 
 CREATE OPERATOR pg_catalog.!~~* (
     LEFTARG = "any",
     RIGHTARG = duckdb.unresolved_type,
-    FUNCTION = duckdb_unresolved_type_operator
+    FUNCTION = duckdb.unresolved_type_operator
 );
 
 CREATE TYPE duckdb.union;
@@ -686,10 +762,12 @@ LANGUAGE C AS 'MODULE_PATHNAME', 'pgduckdb_enable_motherduck';
 CREATE TYPE duckdb.map;
 CREATE FUNCTION duckdb.map_in(cstring) RETURNS duckdb.map AS 'MODULE_PATHNAME', 'duckdb_map_in' LANGUAGE C IMMUTABLE STRICT;
 CREATE FUNCTION duckdb.map_out(duckdb.map) RETURNS cstring AS 'MODULE_PATHNAME', 'duckdb_map_out' LANGUAGE C IMMUTABLE STRICT;
+CREATE FUNCTION duckdb.map_subscript(internal) RETURNS internal AS 'MODULE_PATHNAME', 'duckdb_map_subscript' LANGUAGE C IMMUTABLE STRICT;
 CREATE TYPE duckdb.map(
     INTERNALLENGTH = VARIABLE,
     INPUT = duckdb.map_in,
-    OUTPUT = duckdb.map_out
+    OUTPUT = duckdb.map_out,
+    SUBSCRIPT = duckdb.map_subscript
 );
 
 -- Drop legacy secret objects
@@ -712,15 +790,31 @@ CREATE FUNCTION duckdb.create_simple_secret(
     region        TEXT DEFAULT '',
     url_style     TEXT DEFAULT '',
     provider      TEXT DEFAULT '',
-    endpoint      TEXT DEFAULT ''
+    endpoint      TEXT DEFAULT '',
+    scope         TEXT DEFAULT ''
 )
 RETURNS TEXT
 SET search_path = pg_catalog, pg_temp
 LANGUAGE C AS 'MODULE_PATHNAME', 'pgduckdb_create_simple_secret';
 
-CREATE FUNCTION duckdb.create_azure_secret(TEXT) -- connection string
+CREATE FUNCTION duckdb.create_azure_secret(connection_string TEXT, scope TEXT DEFAULT '')
 RETURNS TEXT
 SET search_path = pg_catalog, pg_temp
 LANGUAGE C AS 'MODULE_PATHNAME', 'pgduckdb_create_azure_secret';
 
+ALTER TABLE duckdb.extensions ADD COLUMN repository TEXT NOT NULL DEFAULT 'core';
+ALTER TABLE duckdb.extensions RENAME COLUMN enabled TO autoload;
+ALTER TABLE duckdb.extensions ALTER COLUMN autoload SET NOT NULL;
 
+CREATE FUNCTION duckdb.view(dbname text, schema text, view_name text, query text)
+RETURNS SETOF duckdb.row
+SET search_path = pg_catalog, pg_temp
+AS 'MODULE_PATHNAME', 'duckdb_only_function'
+LANGUAGE C;
+
+ALTER FUNCTION duckdb.duckdb_alter_table_trigger RENAME TO _alter_table_trigger;
+ALTER FUNCTION duckdb.duckdb_am_handler RENAME TO _am_handler;
+ALTER FUNCTION duckdb.duckdb_create_table_trigger RENAME TO _create_table_trigger;
+ALTER FUNCTION duckdb.duckdb_drop_trigger RENAME TO _drop_trigger;
+ALTER FUNCTION duckdb.duckdb_grant_trigger RENAME TO _grant_trigger;
+ALTER FUNCTION duckdb.duckdb_update_extensions_table_seq RENAME TO _update_extensions_table_seq;

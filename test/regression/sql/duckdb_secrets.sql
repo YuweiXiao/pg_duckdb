@@ -50,7 +50,7 @@ SELECT duckdb.install_extension('aws');
 CREATE SERVER valid_s3_cred_chain
 TYPE 's3'
 FOREIGN DATA WRAPPER duckdb
-OPTIONS (PROVIDER 'credential_chain', CHAIN ''); -- use empty chain otherwise it takes too much time
+OPTIONS (PROVIDER 'credential_chain', VALIDATION 'none'); -- use empty chain otherwise it takes too much time
 
 -- Drop some
 DROP SERVER valid_r2_server;
@@ -130,7 +130,9 @@ SELECT duckdb.create_simple_secret(
     session_token := 'foo',
     url_style := 'path',
     provider := 'credential_chain',
-    endpoint := 'my-endpoint.com'
+    endpoint := 'my-endpoint.com',
+    scope := 's3://my-bucket',
+    validation := 'none'
 );
 
 -- Alter SERVER (public options only)
@@ -152,9 +154,27 @@ SELECT duckdb.create_simple_secret('GCS', 'my third key', 'my secret'); -- No se
 -- Invalid
 SELECT duckdb.create_simple_secret('BadType', '-', '-');
 
+-- Test backwards compatibility with 1.0.0 SQL signature (9 parameters instead of 11)
+CREATE FUNCTION create_simple_secret_v1_0_0(
+    type          TEXT,
+    key_id        TEXT,
+    secret        TEXT,
+    session_token TEXT DEFAULT '',
+    region        TEXT DEFAULT '',
+    url_style     TEXT DEFAULT '',
+    provider      TEXT DEFAULT '',
+    endpoint      TEXT DEFAULT '',
+    scope         TEXT DEFAULT ''
+)
+RETURNS TEXT
+LANGUAGE C AS 'pg_duckdb', 'pgduckdb_create_simple_secret';
+
+SELECT create_simple_secret_v1_0_0('S3', 'compat-key', 'compat-secret', '', 'us-west-2');
+DROP FUNCTION create_simple_secret_v1_0_0;
+
 -- 2. Azure
 
-SELECT duckdb.create_azure_secret('hello world');
+SELECT duckdb.create_azure_secret('hello world', scope := 'az://myaccount.blob.core.windows.net/');
 
 -- Now check everything.
 
@@ -162,7 +182,8 @@ SELECT fs.srvname, fs.srvtype, fs.srvoptions, um.umoptions
 FROM pg_foreign_server fs
 INNER JOIN pg_foreign_data_wrapper fdw ON fdw.oid = fs.srvfdw
 LEFT JOIN pg_user_mapping um ON um.umserver = fs.oid
-WHERE fdw.fdwname = 'duckdb' AND fs.srvtype != 'motherduck';
+WHERE fdw.fdwname = 'duckdb' AND fs.srvtype != 'motherduck'
+ORDER BY fs.srvname;
 
 SELECT * FROM duckdb.query($$
     SELECT
@@ -187,3 +208,21 @@ SELECT * FROM duckdb.query($$
         FROM duckdb_secrets()
     );
 $$);
+
+set client_min_messages=WARNING; -- suppress NOTICE that include username
+DROP SERVER
+    simple_s3_secret,
+    simple_s3_secret_1,
+    simple_s3_secret_2,
+    simple_s3_secret_3,
+    simple_s3_secret_4,
+    simple_r2_secret,
+    simple_r2_secret_1,
+    simple_gcs_secret,
+    simple_gcs_secret_1,
+    simple_gcs_secret_2,
+    azure_secret
+CASCADE;
+
+-- Remove aws extension
+DELETE FROM duckdb.extensions WHERE name = 'aws';

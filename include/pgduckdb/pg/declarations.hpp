@@ -25,6 +25,9 @@ typedef double Cardinality;
 
 typedef uintptr_t Datum;
 
+struct MemoryContextData;
+typedef MemoryContextData *MemoryContext;
+
 struct FormData_pg_attribute;
 typedef FormData_pg_attribute *Form_pg_attribute;
 
@@ -47,8 +50,8 @@ typedef struct ParamListInfoData *ParamListInfo;
 
 struct PlannedStmt;
 
-typedef char *Pointer;
-typedef Pointer Page;
+typedef char PageData;
+typedef PageData *Page;
 
 struct Query;
 
@@ -78,7 +81,15 @@ typedef MinimalTupleData *MinimalTuple;
 
 struct TupleQueueReader;
 
+struct ObjectAddress;
+
 struct PlanState;
 
 struct Plan;
+
+struct FuncExpr;
+
+typedef struct FunctionCallInfoBaseData *FunctionCallInfo;
+
+struct ExplainState;
 }

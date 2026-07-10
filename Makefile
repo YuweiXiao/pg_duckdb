@@ -1,5 +1,7 @@
 .PHONY: duckdb install-duckdb clean-duckdb clean-all lintcheck check-regression-duckdb clean-regression
 
+PG_DUCKDB_VERSION ?= $(shell git describe --always --dirty 2>/dev/null || echo "unknown")
+
 MODULE_big = pg_duckdb
 EXTENSION = pg_duckdb
 DATA = pg_duckdb.control $(wildcard sql/pg_duckdb--*.sql)
@@ -13,9 +15,9 @@ OBJS += $(subst .c,.o, $(C_SRCS))
 # set to `make` to disable ninja
 DUCKDB_GEN ?= ninja
 # used to know what version of extensions to download
-DUCKDB_VERSION = v1.2.2
+DUCKDB_VERSION = v1.5.4
 # duckdb build tweaks
-DUCKDB_CMAKE_VARS = -DBUILD_SHELL=0 -DBUILD_PYTHON=0 -DBUILD_UNITTESTS=0
+DUCKDB_CMAKE_VARS = -DCXX_EXTRA=-fvisibility=default -DBUILD_SHELL=0 -DBUILD_PYTHON=0 -DBUILD_UNITTESTS=0 -DOVERRIDE_GIT_DESCRIBE=$(DUCKDB_VERSION)
 # set to 1 to disable asserts in DuckDB. This is particularly useful in combinition with MotherDuck.
 # When asserts are enabled the released motherduck extension will fail some of
 # those asserts. By disabling asserts it's possible to run a debug build of
@@ -38,15 +40,27 @@ else
 	DUCKDB_MAKE_TARGET = release
 endif
 
-PG_DUCKDB_LINK_FLAGS = -Wl,-rpath,$(PG_LIB)/ -lpq -Lthird_party/duckdb/build/$(DUCKDB_BUILD_TYPE)/src -L$(PG_LIB) -lstdc++ -llz4
 DUCKDB_BUILD_DIR = third_party/duckdb/build/$(DUCKDB_BUILD_TYPE)
 
 ifeq ($(DUCKDB_BUILD), ReleaseStatic)
-	PG_DUCKDB_LINK_FLAGS += third_party/duckdb/build/release/libduckdb_bundle.a
-	FULL_DUCKDB_LIB = $(DUCKDB_BUILD_DIR)/$(DUCKDB_LIB)
+	FULL_DUCKDB_LIB = $(DUCKDB_BUILD_DIR)/libduckdb_bundle.a
+	PG_DUCKDB_LINK_FLAGS = $(FULL_DUCKDB_LIB) -lcurl
 else
-	PG_DUCKDB_LINK_FLAGS += -lduckdb
-	FULL_DUCKDB_LIB = $(DUCKDB_BUILD_DIR)/src/$(DUCKDB_LIB)/libduckdb$(DLSUFFIX)
+	FULL_DUCKDB_LIB = $(DUCKDB_BUILD_DIR)/src/libduckdb$(DLSUFFIX)
+	PG_DUCKDB_LINK_FLAGS = -lduckdb
+endif
+
+
+PG_DUCKDB_LINK_FLAGS += -Wl,-rpath,$(PG_LIB)/ -L$(DUCKDB_BUILD_DIR)/src -L$(PG_LIB) -lstdc++ -llz4
+
+# Ensure -lstdc++fs is included for GCC 8 builds
+CXX ?= c++
+IS_GCC := $(shell $(CXX) --version 2>/dev/null | grep -q "Free Software Foundation" && echo true || echo false)
+ifeq ($(IS_GCC),true)
+  GCC_MAJOR := $(shell $(CXX) -dumpversion 2>/dev/null | cut -d. -f1)
+  ifeq ($(GCC_MAJOR),8)
+    PG_DUCKDB_LINK_FLAGS += -lstdc++fs
+  endif
 endif
 
 ERROR_ON_WARNING ?=
@@ -56,10 +70,10 @@ else
 	ERROR_ON_WARNING =
 endif
 
-COMPILER_FLAGS=-Wno-sign-compare -Wshadow -Wswitch -Wunused-parameter -Wunreachable-code -Wno-unknown-pragmas -Wall -Wextra ${ERROR_ON_WARNING}
+COMPILER_FLAGS=-Wno-sign-compare -Wshadow -Wswitch -Wunused-parameter -Wunreachable-code -Wno-unknown-pragmas -Wall -Wextra -Wno-missing-field-initializers ${ERROR_ON_WARNING}
 
 override PG_CPPFLAGS += -Iinclude -isystem third_party/duckdb/src/include -isystem third_party/duckdb/third_party/re2 -isystem $(INCLUDEDIR_SERVER) ${COMPILER_FLAGS}
-override PG_CXXFLAGS += -std=c++17 ${DUCKDB_BUILD_CXX_FLAGS} ${COMPILER_FLAGS} -Wno-register
+override PG_CXXFLAGS += -std=c++17 ${DUCKDB_BUILD_CXX_FLAGS} ${COMPILER_FLAGS} -Wno-register -Weffc++
 # Ignore declaration-after-statement warnings in our code. Postgres enforces
 # this because their ancient style guide requires it, but we don't care. It
 # would only apply to C files anyway, and we don't have many of those. The only
@@ -71,6 +85,10 @@ override PG_CFLAGS += -Wno-declaration-after-statement
 SHLIB_LINK += $(PG_DUCKDB_LINK_FLAGS)
 
 include Makefile.global
+
+# Only pass the version define to the one file that needs it, so that ccache
+# doesn't invalidate everything on every commit.
+src/pgduckdb.o: PG_CPPFLAGS += -DPG_DUCKDB_VERSION="\"$(PG_DUCKDB_VERSION)\""
 
 # We need the DuckDB header files to build our own .o files. We depend on the
 # duckdb submodule HEAD, because that target pulls in the submodule which
@@ -95,13 +113,17 @@ check-regression-duckdb:
 clean-regression:
 	$(MAKE) -C test/regression clean-regression
 
+# Specify AWS_REGION to make sure test output the same thing regardless of where they are run
 installcheck: all install
-	$(MAKE) check-regression-duckdb
+	AWS_REGION=us-east-1 $(MAKE) check-regression-duckdb
 
 pycheck: all install
 	LD_LIBRARY_PATH=$(PG_LIBDIR):${LD_LIBRARY_PATH} pytest -n $(PYTEST_CONCURRENCY)
 
-check: installcheck pycheck
+check: installcheck pycheck schedulecheck
+
+schedulecheck:
+	./scripts/schedule-check.sh
 
 duckdb: $(FULL_DUCKDB_LIB)
 
@@ -109,6 +131,9 @@ duckdb: $(FULL_DUCKDB_LIB)
 	git submodule update --init --recursive
 
 $(FULL_DUCKDB_LIB): .git/modules/third_party/duckdb/HEAD third_party/pg_duckdb_extensions.cmake
+ifeq ($(DUCKDB_BUILD), ReleaseStatic)
+	mkdir -p third_party/duckdb/build/release/vcpkg_installed
+endif
 	OVERRIDE_GIT_DESCRIBE=$(DUCKDB_VERSION) \
 	GEN=$(DUCKDB_GEN) \
 	CMAKE_VARS="$(DUCKDB_CMAKE_VARS)" \

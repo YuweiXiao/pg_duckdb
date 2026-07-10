@@ -26,6 +26,34 @@ SELECT * FROM int_array_1d;
  {}
 (4 rows)
 
+SET duckdb.log_pg_explain = true;
+SELECT * FROM int_array_1d WHERE a @> ARRAY[4];
+NOTICE:  (PGDuckDB/PostgresTableReader)
+
+QUERY: SELECT a FROM public.int_array_1d
+RUNNING: ON 1 PARALLEL WORKER(S).
+EXECUTING: 
+Parallel Seq Scan on int_array_1d
+
+      a       
+--------------
+ {4,5,NULL,7}
+(1 row)
+
+SELECT * FROM duckdb.query($$ FROM pgduckdb.public.int_array_1d WHERE contains(a, 4) $$);
+NOTICE:  (PGDuckDB/PostgresTableReader)
+
+QUERY: SELECT a FROM public.int_array_1d
+RUNNING: ON 1 PARALLEL WORKER(S).
+EXECUTING: 
+Parallel Seq Scan on int_array_1d
+
+      a       
+--------------
+ {4,5,NULL,7}
+(1 row)
+
+RESET duckdb.log_pg_explain;
 -- INT4 (two dimensional data, single dimension type)
 CREATE TABLE int_array_2d(a INT[]);
 INSERT INTO int_array_2d VALUES
@@ -280,6 +308,7 @@ INSERT INTO numeric_array_1d SELECT CAST(a as NUMERIC[]) FROM (VALUES
     ('{}')
 ) t(a);
 SELECT * FROM numeric_array_1d;
+WARNING:  (PGDuckDB/CreatePlan) Prepared query returned an error: Not implemented Error: Unsupported PostgreSQL type found in query: DuckDB requires the precision of a NUMERIC to be set. You can choose to convert these NUMERICs to a DOUBLE by using 'SET duckdb.convert_unsupported_numeric_to_double = true'
          a          
 --------------------
  {1.1,2.2,3.3}
@@ -288,6 +317,17 @@ SELECT * FROM numeric_array_1d;
  {}
 (4 rows)
 
+SET duckdb.convert_unsupported_numeric_to_double = true;
+SELECT * FROM numeric_array_1d;
+         a          
+--------------------
+ {1.1,2.2,3.3}
+ 
+ {4.4,5.5,NULL,7.7}
+ {}
+(4 rows)
+
+RESET duckdb.convert_unsupported_numeric_to_double;
 -- UUID (single dimension)
 CREATE TABLE uuid_array_1d(a UUID[]);
 INSERT INTO uuid_array_1d SELECT CAST(a as UUID[]) FROM (VALUES
@@ -556,6 +596,7 @@ INSERT INTO numeric_array_2d VALUES
     ('{}'),
     ('{{11.1,12.2},{NULL,14.4}}');
 SELECT * FROM numeric_array_2d;
+WARNING:  (PGDuckDB/CreatePlan) Prepared query returned an error: Not implemented Error: Unsupported PostgreSQL type found in query: DuckDB requires the precision of a NUMERIC to be set. You can choose to convert these NUMERICs to a DOUBLE by using 'SET duckdb.convert_unsupported_numeric_to_double = true'
                a                
 --------------------------------
  {{1.1,2.2},{3.3,4.4}}
@@ -565,6 +606,18 @@ SELECT * FROM numeric_array_2d;
  {{11.1,12.2},{NULL,14.4}}
 (5 rows)
 
+SET duckdb.convert_unsupported_numeric_to_double = true;
+SELECT * FROM numeric_array_2d;
+               a                
+--------------------------------
+ {{1.1,2.2},{3.3,4.4}}
+ {{5.5,6.6,7.7},{8.8,9.9,10.1}}
+ 
+ {}
+ {{11.1,12.2},{NULL,14.4}}
+(5 rows)
+
+RESET duckdb.convert_unsupported_numeric_to_double;
 -- UUID (two dimensions)
 CREATE TABLE uuid_array_2d(a UUID[][]);
 INSERT INTO uuid_array_2d VALUES
@@ -601,6 +654,77 @@ SELECT * FROM regclass_array_2d;
  {{1262,1213},{NULL,1261}}
 (5 rows)
 
+-- Complex DuckDB array types testing
+-- STRUCT arrays
+SELECT * FROM duckdb.query($$
+SELECT
+    [{'name': 'Alice', 'age': 30}, {'name': 'Bob', 'age': 25}] as people_array,
+    [{'name': 'Charlie', 'age': 35}] as single_person,
+    CAST([] AS STRUCT(name VARCHAR, age INTEGER)[]) as empty_array
+$$);
+                       people_array                        |          single_person           | empty_array 
+-----------------------------------------------------------+----------------------------------+-------------
+ {"{'name': Alice, 'age': 30}","{'name': Bob, 'age': 25}"} | {"{'name': Charlie, 'age': 35}"} | {}
+(1 row)
+
+-- UNION arrays
+SELECT * FROM duckdb.query($$
+SELECT
+    [union_value(str := 'hello'), union_value(str := 'world')] as string_union_array,
+    [union_value(num := 42), union_value(num := 100)] as number_union_array,
+    [CAST(union_value(num := 42) AS UNION(str VARCHAR, num INTEGER)), union_value(str := 'a100')] as mixed_union_array,
+    CAST([] AS UNION(str VARCHAR, num INTEGER)[]) as empty_union_array
+$$);
+ string_union_array | number_union_array | mixed_union_array | empty_union_array 
+--------------------+--------------------+-------------------+-------------------
+ {hello,world}      | {42,100}           | {42,a100}         | {}
+(1 row)
+
+-- MAP arrays
+SELECT * FROM duckdb.query($$
+SELECT
+    [map(['key1', 'key2'], [10, 20]), map(['a'], [100])] as map_array,
+    [map(['x', 'y', 'z'], [1, 2, 3])] as single_map,
+    CAST([] AS MAP(VARCHAR, INTEGER)[]) as empty_map_array
+$$);
+            map_array             |     single_map      | empty_map_array 
+----------------------------------+---------------------+-----------------
+ {"{key1=10, key2=20}","{a=100}"} | {"{x=1, y=2, z=3}"} | {}
+(1 row)
+
+CREATE TABLE text_array_ctas AS SELECT * FROM duckdb.query($$
+    SELECT ['box office', 'hollywood', '2025 Predictions', 'Movies', 'Culture', 'Best of 2025'] as tags
+$$);
+CREATE TABLE json_array_ctas AS SELECT * FROM duckdb.query($$
+    SELECT [{'key': 'value'}, {'foo': 'bar'}]::JSON[] as data
+$$);
+SELECT * FROM text_array_ctas;
+                                   tags                                    
+---------------------------------------------------------------------------
+ {"box office",hollywood,"2025 Predictions",Movies,Culture,"Best of 2025"}
+(1 row)
+
+SELECT * FROM json_array_ctas;
+                                 data                                  
+-----------------------------------------------------------------------
+ {"{\"key\":\"value\",\"foo\":null}","{\"key\":null,\"foo\":\"bar\"}"}
+(1 row)
+
+-- Check column types
+SELECT attname, atttypid::regtype
+FROM pg_attribute
+WHERE attrelid IN ('text_array_ctas'::regclass, 'json_array_ctas'::regclass)
+  AND attnum > 0
+ORDER BY attrelid::regclass::text, attname;
+ attname | atttypid 
+---------+----------
+ data    | json[]
+ tags    | text[]
+(2 rows)
+
+-- This was crashing before treating DuckDB varchar array as text array
+ANALYZE text_array_ctas;
+ANALYZE json_array_ctas;
 -- Cleanup
 DROP TABLE int_array_0d;
 DROP TABLE int_array_1d;
@@ -622,6 +746,8 @@ DROP TABLE numeric_array_1d;
 DROP TABLE uuid_array_1d;
 DROP TABLE json_array_1d;
 DROP TABLE jsonb_array_1d;
+DROP TABLE text_array_ctas;
+DROP TABLE json_array_ctas;
 DROP TABLE regclass_array_1d;
 DROP TABLE char_array_2d;
 DROP TABLE smallint_array_2d;

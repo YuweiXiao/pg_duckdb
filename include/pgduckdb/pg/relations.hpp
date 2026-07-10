@@ -22,6 +22,8 @@ bool TupleIsNull(TupleTableSlot *slot);
 
 void SlotGetAllAttrs(TupleTableSlot *slot);
 
+TupleTableSlot *ExecStoreMinimalTupleUnsafe(MinimalTuple minmal_tuple, TupleTableSlot *slot, bool shouldFree);
+
 double EstimateRelSize(Relation rel);
 
 Oid GetRelidFromSchemaAndTable(const char *, const char *);
@@ -34,5 +36,11 @@ char *GenerateQualifiedRelationName(Relation rel);
 const char *QuoteIdentifier(const char *ident);
 
 const char *GetRelationName(Relation rel);
+
+Oid GetOid(Form_pg_class rel);
+
+namespace pg {
+Form_pg_attribute GetAttributeByName(TupleDesc tupdesc, const char *colname);
+}
 
 } // namespace pgduckdb

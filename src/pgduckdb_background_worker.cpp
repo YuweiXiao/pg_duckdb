@@ -9,12 +9,18 @@
 #include "duckdb/catalog/catalog_entry/column_dependency_manager.hpp"
 #include "duckdb/parser/column_list.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 #include "duckdb/main/attached_database.hpp"
+#include "pgduckdb/pgduckdb_ddl.hpp"
+#include "pgduckdb/pgduckdb_fdw.hpp"
 #include "pgduckdb/pgduckdb_types.hpp"
 #include "pgduckdb/pgduckdb_utils.hpp"
+#include "pgduckdb/pg/relations.hpp"
 #include "pgduckdb/utility/cpp_wrapper.hpp"
+#include "pgduckdb/pg/string_utils.hpp"
 #include <string>
 #include <unordered_map>
 #include <sys/file.h>
@@ -22,37 +28,40 @@
 
 extern "C" {
 #include "postgres.h"
-#include "fmgr.h"
 #include "access/xact.h"
-#include "miscadmin.h"
-#include "pgstat.h"
-#include "executor/spi.h"
+#include "catalog/dependency.h"
+#include "catalog/namespace.h"
+#include "catalog/objectaddress.h"
+#include "catalog/pg_authid.h"
+#include "catalog/pg_class.h"
+#include "catalog/pg_extension.h"
+#include "catalog/pg_foreign_server.h"
+#include "catalog/pg_namespace.h"
 #include "commands/dbcommands.h"
 #include "common/file_utils.h"
+#include "executor/spi.h"
+#include "fmgr.h"
+#include "miscadmin.h"
+#include "pgstat.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
-#include "tcop/tcopprot.h"
 #include "storage/proc.h"
 #include "storage/shmem.h"
-#include "utils/builtins.h"
-#include "catalog/dependency.h"
-#include "catalog/pg_authid.h"
-#include "catalog/namespace.h"
-#include "catalog/pg_namespace.h"
-#include "catalog/pg_extension.h"
+#include "tcop/tcopprot.h"
 #include "utils/acl.h"
+#include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/palloc.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
-#include "catalog/objectaddress.h"
 }
 
 #include "pgduckdb/pgduckdb.h"
-#include "pgduckdb/pgduckdb_guc.h"
+#include "pgduckdb/pgduckdb_guc.hpp"
 #include "pgduckdb/pgduckdb_duckdb.hpp"
 #include "pgduckdb/pgduckdb_background_worker.hpp"
 #include "pgduckdb/pgduckdb_metadata_cache.hpp"
@@ -111,14 +120,14 @@ static BackgroundWorkerShmemStruct *BgwShmemStruct;
 MUST be called under a lock
 Get the BGW state for the current database (MyDatabaseId)
 */
-BgwStatePerDB *
+static BgwStatePerDB *
 FindState() {
 	bool found = false;
 	auto state = (BgwStatePerDB *)hash_search(BgwShmemStruct->statePerDB, &MyDatabaseId, HASH_FIND, &found);
 	return found ? state : nullptr;
 }
 
-BgwStatePerDB *
+static BgwStatePerDB *
 GetState() {
 	Assert(is_background_worker);
 	auto state = FindState();
@@ -150,7 +159,7 @@ BackgroundWorkerCheck(duckdb::Connection &connection, int64_t &last_activity_cou
 
 bool CanTakeBgwLockForDatabase(Oid database_oid);
 
-bool
+static bool
 RunOneCheck(int64_t &last_activity_count) {
 	// No need to run if MD is not enabled.
 	if (!IsMotherDuckEnabled()) {
@@ -175,7 +184,7 @@ RunOneCheck(int64_t &last_activity_count) {
 	return false;
 }
 
-void
+static void
 SetBackgroundWorkerState(Oid database_oid) {
 	auto state = (BgwStatePerDB *)hash_search(BgwShmemStruct->statePerDB, &database_oid, HASH_ENTER, NULL);
 	state->latch = MyLatch;
@@ -183,7 +192,7 @@ SetBackgroundWorkerState(Oid database_oid) {
 	state->bgw_session_hint_is_reused = false;
 }
 
-void
+static void
 BgwMainLoop() {
 	elog(LOG, "pg_duckdb background worker: starting");
 
@@ -227,12 +236,17 @@ BgwMainLoop() {
 		ResetLatch(MyLatch);
 	}
 
+	ddb_connection.reset();
+	DuckDBManager::Reset();
+
 	elog(LOG, "pg_duckdb background worker for database '%s' (%u) has now terminated.", db_name, MyDatabaseId);
 }
 
 } // namespace pgduckdb
 
 extern "C" {
+
+PGDLLEXPORT void pgduckdb_background_worker_main(Datum main_arg);
 
 PGDLLEXPORT void
 pgduckdb_background_worker_main(Datum main_arg) {
@@ -298,6 +312,61 @@ force_motherduck_sync(PG_FUNCTION_ARGS) {
 }
 
 namespace pgduckdb {
+#if PG_VERSION_NUM >= 190000
+
+/*
+ * Backend-private handle to the shared hash table. PG19's shmem machinery
+ * stores the pointer here (it requires a stable address at request time, so we
+ * can't point it directly at the not-yet-allocated BgwShmemStruct->statePerDB).
+ * ShmemInit copies it into the shared struct so the rest of the code can keep
+ * reaching the hash table through BgwShmemStruct.
+ */
+static HTAB *bgw_state_per_db = NULL;
+
+/*
+ * PG19 replaced the shmem_request_hook/shmem_startup_hook pair plus the manual
+ * RequestAddinShmemSpace/ShmemInitStruct/ShmemInitHash dance with
+ * RegisterShmemCallbacks(). The big win is that the hash table now gets its own
+ * properly sized contiguous shmem area instead of being carved out of the
+ * anonymous add-in freespace, so we no longer have to over-request space by
+ * hand and hope the hash table fits.
+ */
+static void
+ShmemRequest(void * /*opaque_arg*/) {
+	ShmemStructOpts struct_opts = {
+	    .name = "DuckdbBackgroundWorker Data",
+	    .size = sizeof(BackgroundWorkerShmemStruct),
+	    .ptr = (void **)&BgwShmemStruct,
+	};
+	ShmemRequestStructWithOpts(&struct_opts);
+
+	ShmemHashOpts hash_opts = {
+	    .name = "ProcBgwStatePerDB",
+	    .nelems = max_worker_processes,
+	    .hash_info = {.keysize = sizeof(Oid), .entrysize = sizeof(BgwStatePerDB)},
+	    .hash_flags = HASH_ELEM | HASH_BLOBS,
+	    .ptr = &bgw_state_per_db,
+	};
+	ShmemRequestHashWithOpts(&hash_opts);
+}
+
+static void
+ShmemInit(void * /*opaque_arg*/) {
+	/*
+	 * Runs once, after both shmem areas have been allocated and BgwShmemStruct
+	 * / bgw_state_per_db have been pointed at them. We only need to initialize
+	 * the struct contents; the hash table itself is already created by the
+	 * machinery. statePerDB lives in shared memory (mapped at the same address
+	 * in every backend), so storing the handle here once is enough for all
+	 * backends to find it.
+	 */
+	MemSet(BgwShmemStruct, 0, sizeof(BackgroundWorkerShmemStruct));
+	SpinLockInit(&BgwShmemStruct->lock);
+	BgwShmemStruct->statePerDB = bgw_state_per_db;
+}
+
+#else
+
 #if PG_VERSION_NUM >= 150000
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 #endif
@@ -356,9 +425,11 @@ ShmemStartup(void) {
 	LWLockRelease(AddinShmemInitLock);
 }
 
+#endif
+
 constexpr const char *PGDUCKDB_SYNC_WORKER_NAME = "pg_duckdb sync worker";
 
-bool
+static bool
 HasBgwRunningForMyDatabase() {
 	const auto num_backends = pgstat_fetch_stat_numbackends();
 	for (int backend_idx = 1; backend_idx <= num_backends; ++backend_idx) {
@@ -433,15 +504,27 @@ UnclaimBgwSessionHint(int /*code*/, Datum /*arg*/) {
 void
 InitBackgroundWorkersShmem(void) {
 	/* Set up the shared memory hooks */
+#if PG_VERSION_NUM >= 190000
+	/*
+	 * RegisterShmemCallbacks stores the pointer we pass (it lappend()s it onto
+	 * a list and calls request_fn later, once this function has already
+	 * returned), so the struct must outlive this call. Hence "static".
+	 */
+	static const ShmemCallbacks callbacks = {
+	    .request_fn = ShmemRequest,
+	    .init_fn = ShmemInit,
+	};
+	RegisterShmemCallbacks(&callbacks);
+#else
 #if PG_VERSION_NUM >= 150000
 	prev_shmem_request_hook = shmem_request_hook;
 	shmem_request_hook = ShmemRequest;
 #else
 	ShmemRequest();
 #endif
-
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = ShmemStartup;
+#endif
 
 	Datum random_uuid = DirectFunctionCall1(gen_random_uuid, 0);
 	Datum uuid_datum = DirectFunctionCall1(uuid_out, random_uuid);
@@ -534,7 +617,7 @@ PossiblyReuseBgwSessionHint(void) {
 bool doing_motherduck_sync;
 char *current_motherduck_catalog_version;
 
-std::string
+static std::string
 PgSchemaName(const std::string &db_name, const std::string &schema_name, bool is_default_db) {
 	if (is_default_db) {
 		/*
@@ -553,13 +636,19 @@ PgSchemaName(const std::string &db_name, const std::string &schema_name, bool is
 	return oss.str();
 }
 
-std::string
-DropPgTableString(const char *postgres_schema_name, const char *table_name, bool with_cascade) {
+static std::string
+DropPgRelationString(const char *postgres_schema_name, const char *relation_name, char relation_kind,
+                     bool with_cascade) {
 	std::ostringstream oss;
-	oss << "DROP TABLE ";
+	oss << "DROP ";
+	if (relation_kind == RELKIND_VIEW) {
+		oss << "VIEW ";
+	} else {
+		oss << "TABLE ";
+	}
 	oss << duckdb::KeywordHelper::WriteQuoted(postgres_schema_name, '"');
 	oss << ".";
-	oss << duckdb::KeywordHelper::WriteQuoted(table_name, '"');
+	oss << duckdb::KeywordHelper::WriteQuoted(relation_name, '"');
 	if (with_cascade) {
 		oss << " CASCADE";
 	}
@@ -567,7 +656,63 @@ DropPgTableString(const char *postgres_schema_name, const char *table_name, bool
 	return oss.str();
 }
 
-std::string
+static std::string
+CreatePgViewString(duckdb::CreateViewInfo &info, bool is_default_db) {
+	std::ostringstream oss;
+
+	oss << "CREATE VIEW ";
+	std::string schema_name = PgSchemaName(info.catalog, info.schema, is_default_db);
+	oss << duckdb::KeywordHelper::WriteQuoted(schema_name, '"');
+	oss << ".";
+	oss << duckdb::KeywordHelper::WriteQuoted(info.view_name, '"');
+	if (!info.aliases.empty()) {
+		oss << " (";
+		oss << duckdb::StringUtil::Join(info.aliases, info.aliases.size(), ", ", [](const std::string &name) {
+			return duckdb::KeywordHelper::WriteQuoted(name, '"');
+		});
+		oss << ")";
+	}
+	oss << " AS SELECT ";
+	auto it_names = info.names.begin();
+	auto it_types = info.types.begin();
+
+	bool first = true;
+
+	for (; it_names != info.names.end() && it_types != info.types.end(); it_names++, it_types++) {
+		Oid postgres_type = GetPostgresDuckDBType(*it_types);
+		if (postgres_type == InvalidOid) {
+			elog(WARNING, "Skipping column %s in table %s.%s.%s due to unsupported type", it_names->c_str(),
+			     info.catalog.c_str(), info.schema.c_str(), info.view_name.c_str());
+			continue;
+		}
+		if (!first) {
+			oss << ", ";
+		} else {
+			first = false;
+		}
+
+		oss << "r[" << duckdb::KeywordHelper::WriteQuoted(*it_names, '\'') << "]::";
+		int32_t typemod = GetPostgresDuckDBTypemod(*it_types);
+		oss << format_type_with_typemod(postgres_type, typemod);
+		oss << " AS " << duckdb::KeywordHelper::WriteQuoted(*it_names, '"');
+	}
+
+	if (first) {
+		elog(WARNING, "Skipping view %s.%s.%s because none of its columns had supported types", info.catalog.c_str(),
+		     info.schema.c_str(), info.view_name.c_str());
+		return "";
+	}
+
+	oss << " FROM duckdb.view(";
+	oss << duckdb::KeywordHelper::WriteQuoted(info.catalog) << ", ";
+	oss << duckdb::KeywordHelper::WriteQuoted(info.schema) << ", ";
+	oss << duckdb::KeywordHelper::WriteQuoted(info.view_name) << ", ";
+	oss << duckdb::KeywordHelper::WriteQuoted(info.query->ToString(), '\'');
+	oss << ") r;";
+	return oss.str();
+}
+
+static std::string
 CreatePgTableString(duckdb::CreateTableInfo &info, bool is_default_db) {
 	std::ostringstream oss;
 
@@ -582,8 +727,7 @@ CreatePgTableString(duckdb::CreateTableInfo &info, bool is_default_db) {
 	for (auto &column : info.columns.Logical()) {
 		Oid postgres_type = GetPostgresDuckDBType(column.Type());
 		if (postgres_type == InvalidOid) {
-			elog(WARNING, "Skipping column %s in table %s.%s.%s due to unsupported type", column.Name().c_str(),
-			     info.catalog.c_str(), info.schema.c_str(), info.table.c_str());
+
 			continue;
 		}
 
@@ -630,7 +774,7 @@ CreatePgSchemaString(std::string postgres_schema_name) {
  * See the following thread for details:
  * https://www.postgresql.org/message-id/flat/CAFcNs%2Bp%2BfD5HEXEiZMZC1COnXkJCMnUK0%3Dr4agmZP%3D9Hi%2BYcJA%40mail.gmail.com
  */
-void
+static void
 SPI_commit_that_works_in_bgworker() {
 	if (is_background_worker) {
 		SPI_finish();
@@ -695,8 +839,119 @@ SPI_run_utility_command(const char *query) {
 }
 
 static bool
+CreateView(const char *postgres_schema_name, const char *view_name, const char *create_view_query,
+           bool drop_with_cascade) {
+	/* -1 is for the NULL terminator */
+	if (strlen(view_name) > NAMEDATALEN - 1) {
+		ereport(WARNING, (errmsg("Skipping sync of MotherDuck view '%s' because its name is too long", view_name),
+		                  errhint("The maximum length of a view name is %d characters", NAMEDATALEN - 1)));
+		return false;
+	}
+
+	/*
+	 * We need to fetch this over-and-over again, because we commit the
+	 * transaction and thus release locks. So in theory the schema could be
+	 * deleted/renamed etc.
+	 */
+	Oid schema_oid = get_namespace_oid(postgres_schema_name, false);
+	HeapTuple tuple = SearchSysCache2(RELNAMENSP, CStringGetDatum(view_name), ObjectIdGetDatum(schema_oid));
+
+	bool did_delete_table = false;
+	if (HeapTupleIsValid(tuple)) {
+		Form_pg_class postgres_relation = (Form_pg_class)GETSTRUCT(tuple);
+		/* The table already exists in Postgres, so we cannot simply create it. */
+
+		if (!IsMotherDuckTable(postgres_relation) && !IsMotherDuckView(postgres_relation)) {
+			/*
+			 * Oops, we have a conflict. Let's notify the user, and
+			 * not do anything else
+			 */
+			elog(WARNING,
+			     "Skipping sync of MotherDuck view %s.%s because its name conflicts with an "
+			     "already existing table/view/index in Postgres",
+			     postgres_schema_name, view_name);
+			ReleaseSysCache(tuple);
+			return false;
+		}
+
+		char relation_kind = postgres_relation->relkind;
+
+		ReleaseSysCache(tuple);
+
+		/*
+		 * It's an old version of this DuckDB table, we can safely
+		 * drop it and recreate it.
+		 */
+		std::string drop_table_query =
+		    DropPgRelationString(postgres_schema_name, view_name, relation_kind, drop_with_cascade);
+
+		/* We use this to roll back the drop if the CREATE after fails */
+		BeginInternalSubTransaction(NULL);
+
+		/* Revert back to original privileges */
+		if (!SPI_run_utility_command(drop_table_query.c_str())) {
+
+			ereport(WARNING, (errmsg("Failed to sync MotherDuck view %s.%s", postgres_schema_name, view_name),
+
+			                  errdetail("While executing command: %s", create_view_query),
+			                  errhint("See previous WARNING for details")));
+			/*
+			 * Rollback the subtransaction to clean up the subtransaction
+			 * state. Even though there's nothing actually in it. So we could
+			 * we could just as well commit it, but rolling back seems more
+			 * sensible.
+			 */
+			RollbackAndReleaseCurrentSubTransaction();
+			return false;
+		}
+
+		did_delete_table = true;
+	}
+
+	Oid saved_userid;
+	int sec_context;
+	GetUserIdAndSecContext(&saved_userid, &sec_context);
+	SetUserIdAndSecContext(MotherDuckPostgresUserOid(), sec_context | SECURITY_LOCAL_USERID_CHANGE);
+	bool create_table_succeeded = SPI_run_utility_command(create_view_query);
+	SetUserIdAndSecContext(saved_userid, sec_context);
+	/* Revert back to original privileges */
+	if (!create_table_succeeded) {
+
+		ereport(WARNING, (errmsg("Failed to sync MotherDuck view %s.%s", postgres_schema_name, view_name),
+
+		                  errdetail("While executing command: %s", create_view_query),
+		                  errhint("See previous WARNING for details")));
+		if (did_delete_table) {
+			/* Rollback the drop that succeeded */
+			RollbackAndReleaseCurrentSubTransaction();
+		}
+		return false;
+	}
+
+	if (did_delete_table) {
+		/*
+		 * Commit the subtransaction that contains both the drop and the create that
+		 * contains the actual table creation.
+		 */
+		ReleaseCurrentSubTransaction();
+	}
+
+	/* And then we also commit the actual transaction to release any locks that
+	 * were necessary to execute it. */
+	SPI_commit_that_works_in_bgworker();
+	return true;
+}
+
+static bool
 CreateTable(const char *postgres_schema_name, const char *table_name, const char *create_table_query,
             bool drop_with_cascade) {
+	/* -1 is for the NULL terminator */
+	if (strlen(table_name) > NAMEDATALEN - 1) {
+		ereport(WARNING, (errmsg("Skipping sync of MotherDuck table '%s' because its name is too long", table_name),
+		                  errhint("The maximum length of a table name is %d characters", NAMEDATALEN - 1)));
+		return false;
+	}
+
 	/*
 	 * We need to fetch this over-and-over again, because we commit the
 	 * transaction and thus release locks. So in theory the schema could be
@@ -710,7 +965,7 @@ CreateTable(const char *postgres_schema_name, const char *table_name, const char
 		Form_pg_class postgres_relation = (Form_pg_class)GETSTRUCT(tuple);
 		/* The table already exists in Postgres, so we cannot simply create it. */
 
-		if (!IsMotherDuckTable(postgres_relation)) {
+		if (!IsMotherDuckTable(postgres_relation) && !IsMotherDuckView(postgres_relation)) {
 			/*
 			 * Oops, we have a conflict. Let's notify the user, and
 			 * not do anything else
@@ -722,13 +977,17 @@ CreateTable(const char *postgres_schema_name, const char *table_name, const char
 			ReleaseSysCache(tuple);
 			return false;
 		}
+
+		char relation_kind = postgres_relation->relkind;
+
 		ReleaseSysCache(tuple);
 
 		/*
 		 * It's an old version of this DuckDB table, we can safely
 		 * drop it and recreate it.
 		 */
-		std::string drop_table_query = DropPgTableString(postgres_schema_name, table_name, drop_with_cascade);
+		std::string drop_table_query =
+		    DropPgRelationString(postgres_schema_name, table_name, relation_kind, drop_with_cascade);
 
 		/* We use this to roll back the drop if the CREATE after fails */
 		BeginInternalSubTransaction(NULL);
@@ -756,7 +1015,7 @@ CreateTable(const char *postgres_schema_name, const char *table_name, const char
 	Oid saved_userid;
 	int sec_context;
 	GetUserIdAndSecContext(&saved_userid, &sec_context);
-	SetUserIdAndSecContext(MotherDuckPostgresUser(), sec_context | SECURITY_LOCAL_USERID_CHANGE);
+	SetUserIdAndSecContext(MotherDuckPostgresUserOid(), sec_context | SECURITY_LOCAL_USERID_CHANGE);
 	bool create_table_succeeded = SPI_run_utility_command(create_table_query);
 	SetUserIdAndSecContext(saved_userid, sec_context);
 	/* Revert back to original privileges */
@@ -788,8 +1047,13 @@ CreateTable(const char *postgres_schema_name, const char *table_name, const char
 }
 
 static bool
-DropTable(const char *fully_qualified_table, bool drop_with_cascade) {
-	const char *query = psprintf("DROP TABLE %s%s", fully_qualified_table, drop_with_cascade ? " CASCADE" : "");
+DropRelation(const char *fully_qualified_table, char relation_kind, bool drop_with_cascade) {
+	const char *relkind_string = "TABLE";
+	if (relation_kind == RELKIND_VIEW) {
+		relkind_string = "VIEW";
+	}
+	const char *query =
+	    psprintf("DROP %s %s%s", relkind_string, fully_qualified_table, drop_with_cascade ? " CASCADE" : "");
 
 	if (!SPI_run_utility_command(query)) {
 		ereport(WARNING,
@@ -799,7 +1063,7 @@ DropTable(const char *fully_qualified_table, bool drop_with_cascade) {
 		return false;
 	}
 	/*
-	 * We explicitely don't call SPI_commit_that_works_in_background_worker
+	 * We explicitly don't call SPI_commit_that_works_in_background_worker
 	 * here, because that makes transactional considerations easier. And when
 	 * deleting tables, it doesn't matter how long we keep locks on them,
 	 * because they are already deleted upstream so there can be no queries on
@@ -816,23 +1080,37 @@ DropTable(const char *fully_qualified_table, bool drop_with_cascade) {
  */
 static bool
 GrantAccessToSchema(const char *postgres_schema_name) {
-	if (pgduckdb::MotherDuckPostgresUser() == BOOTSTRAP_SUPERUSERID) {
-		/*
-		 * We don't need to grant access to the bootstrap superuser. It already
-		 * has every access it might need.
-		 */
-		return true;
-	}
-
-	/* Grant access to the schema to the current user */
+	/*
+	 * Grant full access to the schema to the motherduck postgres user so that
+	 * it can create and drop the tables.
+	 */
 	const char *grant_query = psprintf("GRANT ALL ON SCHEMA %s TO %s", quote_identifier(postgres_schema_name),
-	                                   quote_identifier(duckdb_postgres_role));
+	                                   quote_identifier(MotherDuckPostgresUserName()));
 	if (!SPI_run_utility_command(grant_query)) {
 		ereport(WARNING,
 		        (errmsg("Failed to grant access to MotherDuck schema %s", postgres_schema_name),
 		         errdetail("While executing command: %s", grant_query), errhint("See previous WARNING for details")));
 		return false;
 	}
+
+	/*
+	 * Grant USAGE on the schema to duckdb.postgres_role so that members of
+	 * that role can SELECT from the synced tables. The MotherDuckPostgresUser
+	 * owns the tables, but regular users who are members of duckdb.postgres_role
+	 * need USAGE on the schema to access them.
+	 */
+	if (!IsEmptyString(duckdb_postgres_role) && !AreStringEqual(duckdb_postgres_role, MotherDuckPostgresUserName())) {
+		grant_query = psprintf("GRANT USAGE ON SCHEMA %s TO %s", quote_identifier(postgres_schema_name),
+		                       quote_identifier(duckdb_postgres_role));
+		if (!SPI_run_utility_command(grant_query)) {
+			ereport(WARNING, (errmsg("Failed to grant USAGE on MotherDuck schema %s to %s", postgres_schema_name,
+			                         duckdb_postgres_role),
+			                  errdetail("While executing command: %s", grant_query),
+			                  errhint("See previous WARNING for details")));
+			return false;
+		}
+	}
+
 	return true;
 }
 
@@ -849,18 +1127,18 @@ CreateSchemaIfNotExists(const char *postgres_schema_name, bool is_default_db) {
 	Oid schema_oid = get_namespace_oid(postgres_schema_name, true);
 	if (schema_oid != InvalidOid) {
 		/*
-		 * Let's check if the duckdb.postgres_user can actually create tables
-		 * in this schema. Surprisingly the USAGE permission is not needed to
-		 * create tables in a schema, only to list the tables. So we dont' need
-		 * to check for that one.
+		 * Let's check if the MotherDuck Postgres user can actually create
+		 * tables in this schema. Surprisingly the USAGE permission is not
+		 * needed to create tables in a schema, only to list the tables. So we
+		 * dont need to check for that one.
 		 */
 
 #if PG_VERSION_NUM >= 160000
 		bool user_has_create_access =
-		    object_aclcheck(NamespaceRelationId, schema_oid, MotherDuckPostgresUser(), ACL_CREATE) == ACLCHECK_OK;
+		    object_aclcheck(NamespaceRelationId, schema_oid, MotherDuckPostgresUserOid(), ACL_CREATE) == ACLCHECK_OK;
 #else
 		bool user_has_create_access =
-		    pg_namespace_aclcheck(schema_oid, MotherDuckPostgresUser(), ACL_CREATE) == ACLCHECK_OK;
+		    pg_namespace_aclcheck(schema_oid, MotherDuckPostgresUserOid(), ACL_CREATE) == ACLCHECK_OK;
 #endif
 		if (user_has_create_access) {
 			return true;
@@ -868,16 +1146,18 @@ CreateSchemaIfNotExists(const char *postgres_schema_name, bool is_default_db) {
 		if (is_default_db) {
 			/*
 			 * For non $ddb schemas that already exist we don't want to give
-			 * CREATE privileges to the duckdb.posgres_role automatically. It
-			 * might be some restricted and an attacker with MotherDuck access
-			 * should not be able to create tables in it unless the DBA has
-			 * configured access this way.
+			 * CREATE privileges to the MotherDuck Postgres role automatically.
+			 * It might be some restricted and an attacker with MotherDuck
+			 * access should not be able to create tables in it unless the DBA
+			 * has configured access this way.
 			 */
-			ereport(WARNING, (errmsg("MotherDuck schema %s already exists, but duckdb.postgres_user does not have "
-			                         "CREATE privileges on it",
-			                         postgres_schema_name),
-			                  errhint("You might want to grant ALL privileges to the user '%s' on this schema.",
-			                          duckdb_postgres_role)));
+			ereport(
+			    WARNING,
+			    (errmsg("MotherDuck schema %s already exists, but the configured motherduck table owner does not have "
+			            "CREATE privileges on it",
+			            postgres_schema_name),
+			     errhint("You might want to grant ALL privileges to the user '%s' on this schema.",
+			             MotherDuckPostgresUserName())));
 			return false;
 		}
 
@@ -918,7 +1198,7 @@ CreateSchemaIfNotExists(const char *postgres_schema_name, bool is_default_db) {
 	if (!is_default_db) {
 		/*
 		 * For ddb$ schemas we need to record a dependency between the schema
-		 * and the extension, so that DROP EXTENSION also drops these schemas.
+		 * and the FDW, so that DROP SERVER motherduck also drops these schemas.
 		 */
 		schema_oid = get_namespace_oid(postgres_schema_name, true);
 		if (schema_oid == InvalidOid) {
@@ -932,12 +1212,7 @@ CreateSchemaIfNotExists(const char *postgres_schema_name, bool is_default_db) {
 		    .objectId = schema_oid,
 		    .objectSubId = 0,
 		};
-		ObjectAddress extension_address = {
-		    .classId = ExtensionRelationId,
-		    .objectId = pgduckdb::ExtensionOid(),
-		    .objectSubId = 0,
-		};
-		recordDependencyOn(&schema_address, &extension_address, DEPENDENCY_NORMAL);
+		RecordDependencyOnMDServer(&schema_address);
 	}
 
 	/* Success, so we commit the subtransaction */
@@ -1039,7 +1314,6 @@ SyncMotherDuckCatalogsWithPg_Cpp(bool drop_with_cascade, duckdb::ClientContext &
 				}
 
 				auto &table = entry.Cast<duckdb::TableCatalogEntry>();
-				auto storage_info = table.GetStorageInfo(context);
 
 				auto table_info = duckdb::unique_ptr_cast<duckdb::CreateInfo, duckdb::CreateTableInfo>(table.GetInfo());
 				table_info->schema = table.schema.name;
@@ -1052,6 +1326,29 @@ SyncMotherDuckCatalogsWithPg_Cpp(bool drop_with_cascade, duckdb::ClientContext &
 
 				if (!CreateTable(postgres_schema_name.c_str(), table.name.c_str(), create_query.c_str(),
 				                 drop_with_cascade)) {
+					all_tables_synced_successfully = false;
+					return;
+				}
+			});
+
+			schema.Scan(context, duckdb::CatalogType::VIEW_ENTRY, [&](duckdb::CatalogEntry &entry) {
+				if (entry.type != duckdb::CatalogType::VIEW_ENTRY) {
+					return;
+				}
+
+				auto &view = entry.Cast<duckdb::ViewCatalogEntry>();
+				auto view_info = duckdb::unique_ptr_cast<duckdb::CreateInfo, duckdb::CreateViewInfo>(view.GetInfo());
+
+				view_info->schema = view.schema.name;
+				view_info->catalog = motherduck_db;
+
+				auto create_query = CreatePgViewString(*view_info, is_default_db);
+				if (create_query.empty()) {
+					return;
+				}
+
+				if (!CreateView(postgres_schema_name.c_str(), view.name.c_str(), create_query.c_str(),
+				                drop_with_cascade)) {
 					all_tables_synced_successfully = false;
 					return;
 				}
@@ -1091,7 +1388,9 @@ SyncMotherDuckCatalogsWithPg_Cpp(bool drop_with_cascade, duckdb::ClientContext &
 		 * necessary in most cases.
 		 */
 		auto query_tables = R"(
-			SELECT relid::text FROM duckdb.tables
+			SELECT relid::text, relkind
+			FROM duckdb.tables
+			JOIN pg_class ON oid = relid
 			WHERE duckdb_db = $1 AND (
 				motherduck_catalog_version != $2 OR
 				default_database != $3
@@ -1108,12 +1407,13 @@ SyncMotherDuckCatalogsWithPg_Cpp(bool drop_with_cascade, duckdb::ClientContext &
 			for (auto i = 0; i < current_batch_size; i++) {
 				HeapTuple tuple = deleted_tables_batch->vals[i];
 				char *fully_qualified_table = SPI_getvalue(tuple, SPI_tuptable->tupdesc, 1);
+				char relkind = SPI_getvalue(tuple, SPI_tuptable->tupdesc, 2)[0];
 				/*
 				 * We need to create a new SPI context for the DROP command
 				 * otherwise our batch gets invalidated.
 				 */
 				SPI_connect();
-				DropTable(fully_qualified_table, drop_with_cascade);
+				DropRelation(fully_qualified_table, relkind, drop_with_cascade);
 				SPI_finish();
 			}
 		} while (current_batch_size == deleted_tables_batch_size);

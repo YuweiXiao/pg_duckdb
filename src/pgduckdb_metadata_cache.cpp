@@ -1,3 +1,5 @@
+#include "pgduckdb/pgduckdb_duckdb.hpp"
+
 extern "C" {
 #include "postgres.h"
 
@@ -22,6 +24,7 @@ extern "C" {
 #include "utils/rel.h"
 #include "utils/syscache.h"
 #include "utils/snapmgr.h"
+#include "utils/lsyscache.h"
 }
 
 #include "pgduckdb/pgduckdb.h"
@@ -29,7 +32,7 @@ extern "C" {
 #include "pgduckdb/pgduckdb_metadata_cache.hpp"
 #include "pgduckdb/pgduckdb_userdata_cache.hpp"
 #include "pgduckdb/pgduckdb_background_worker.hpp"
-#include "pgduckdb/pgduckdb_guc.h"
+#include "pgduckdb/pgduckdb_guc.hpp"
 
 namespace pgduckdb {
 struct {
@@ -74,6 +77,12 @@ struct {
 	Oid union_oid;
 	/* The OID of the duckdb.map type */
 	Oid map_oid;
+	/* The OID of the duckdb._struct type  */
+	Oid struct_array_oid;
+	/* The OID of the duckdb._union type */
+	Oid union_array_oid;
+	/* The OID of the duckdb._map type */
+	Oid map_array_oid;
 	/* The OID of the duckdb.json */
 	Oid json_oid;
 	/* The OID of the duckdb Table Access Method */
@@ -100,7 +109,11 @@ uint32 schema_hash_value;
  * IsExtensionRegistered for details).
  */
 static void
+#if PG_VERSION_NUM >= 190000
+InvalidateCaches(Datum /*arg*/, SysCacheIdentifier /*cache_id*/, uint32 hash_value) {
+#else
 InvalidateCaches(Datum /*arg*/, int /*cache_id*/, uint32 hash_value) {
+#endif
 	if (hash_value != schema_hash_value) {
 		return;
 	}
@@ -139,6 +152,9 @@ BuildDuckdbOnlyFunctions() {
 	 */
 	const char *function_names[] = {"read_parquet",
 	                                "read_csv",
+	                                "read_vortex",
+	                                "read_text",
+	                                "read_blob",
 	                                "iceberg_scan",
 	                                "iceberg_metadata",
 	                                "iceberg_snapshots",
@@ -146,6 +162,7 @@ BuildDuckdbOnlyFunctions() {
 	                                "read_json",
 	                                "approx_count_distinct",
 	                                "query",
+	                                "view",
 	                                "json_exists",
 	                                "json_extract",
 	                                "json_extract_string",
@@ -170,9 +187,23 @@ BuildDuckdbOnlyFunctions() {
 	                                "epoch_ms",
 	                                "epoch_us",
 	                                "epoch_ns",
+	                                "make_timestamp",
+	                                "make_timestamptz",
 	                                "time_bucket",
 	                                "union_extract",
-	                                "union_tag"};
+	                                "union_tag",
+	                                "cardinality",
+	                                "element_at",
+	                                "map_concat",
+	                                "map_contains",
+	                                "map_contains_entry",
+	                                "map_contains_value",
+	                                "map_entries",
+	                                "map_extract",
+	                                "map_extract_value",
+	                                "map_from_entries",
+	                                "map_keys",
+	                                "map_values"};
 
 	for (uint32_t i = 0; i < lengthof(function_names); i++) {
 		CatCList *catlist = SearchSysCacheList1(PROCNAMEARGSNSP, CStringGetDatum(function_names[i]));
@@ -211,9 +242,54 @@ IsExtensionRegistered() {
 		elog(WARNING, "pgduckdb: IsExtensionRegistered called in an aborted transaction");
 		/* We need to run `get_extension_oid` in a valid transaction */
 		return false;
+	} else if (!IsTransactionState()) {
+		return false;
 	} else if (!ActiveSnapshotSet() && ActivePortal == nullptr) {
 		/* We're not in a transaction block, so we can't populate the cache */
 		return get_extension_oid("pg_duckdb", true) != InvalidOid;
+	}
+
+	/*
+	 * If we're in the middle of running our own CREATE/ALTER EXTENSION script,
+	 * the extension is only partially constructed: the pg_extension row already
+	 * exists (so get_extension_oid succeeds) but objects created later in the
+	 * script, such as the "duckdb" access method, don't exist yet. Populating
+	 * the cache here would store e.g. table_am_oid = InvalidOid, and since our
+	 * invalidation callback only fires on pg_namespace changes to the "duckdb"
+	 * schema, creating the AM afterwards wouldn't invalidate it. We'd be left
+	 * with a valid cache claiming table_am_oid = 0, which aliases every relation
+	 * with relam = 0 (e.g. sequences) into looking like a DuckDB table. So bail
+	 * out without caching; the first call after the script finishes will build
+	 * the cache correctly.
+	 *
+	 * If we already established that this command is building pg_duckdb, use the
+	 * memoized OID to avoid another get_extension_oid() scan for every statement
+	 * in the script.
+	 */
+	static Oid creating_pgduckdb_extension_oid = InvalidOid;
+	if (creating_extension && CurrentExtensionObject == creating_pgduckdb_extension_oid) {
+		return false;
+	}
+
+	Oid extension_oid = get_extension_oid("pg_duckdb", true);
+
+	/*
+	 * We compare OIDs rather than calling get_extension_name(), so that during
+	 * an unrelated CREATE EXTENSION this doesn't do an extra catalog lookup on
+	 * top of the get_extension_oid() we already need.
+	 */
+	if (creating_extension && CurrentExtensionObject == extension_oid) {
+
+		/*
+		 * While we're running our own CREATE/ALTER EXTENSION script this holds the OID
+		 * of the pg_duckdb extension being (re)built. It lets us cheaply recognize the
+		 * many hook invocations that happen during a single command without repeating
+		 * the get_extension_oid() lookup, which is a sequential scan over pg_extension
+		 * on PG17 and older. It's only ever consulted while creating_extension is true,
+		 * so it doesn't need to be reset when the command finishes.
+		 */
+		creating_pgduckdb_extension_oid = CurrentExtensionObject;
+		return false;
 	}
 
 	cache.initializing = true;
@@ -235,7 +311,7 @@ IsExtensionRegistered() {
 		CacheRegisterSyscacheCallback(NAMESPACENAME, InvalidateCaches, (Datum)0);
 	}
 
-	cache.extension_oid = get_extension_oid("pg_duckdb", true);
+	cache.extension_oid = extension_oid;
 	cache.installed = cache.extension_oid != InvalidOid;
 	cache.version++;
 
@@ -252,10 +328,14 @@ IsExtensionRegistered() {
 		cache.struct_oid = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum("struct"), cache.schema_oid);
 		cache.unresolved_type_oid =
 		    GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum("unresolved_type"), cache.schema_oid);
-
 		cache.union_oid = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum("union"), cache.schema_oid);
-
 		cache.map_oid = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum("map"), cache.schema_oid);
+
+		cache.struct_array_oid =
+		    GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum("_struct"), cache.schema_oid);
+		cache.union_array_oid =
+		    GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum("_union"), cache.schema_oid);
+		cache.map_array_oid = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum("_map"), cache.schema_oid);
 
 		cache.json_oid = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum("json"), cache.schema_oid);
 
@@ -270,6 +350,14 @@ IsExtensionRegistered() {
 			cache.postgres_role_oid = BOOTSTRAP_SUPERUSERID;
 		}
 	} else {
+		/*
+		 * It's possible that a duckdb instance is still running, after we have
+		 * dropped the extension (possibly in a different session). This seems
+		 * like a good moment to clean that up if that's the case.
+		 */
+		if (pgduckdb::DuckDBManager::IsInitialized()) {
+			pgduckdb::DuckDBManager::Reset();
+		}
 		elog(DEBUG1, "pgduckdb: extension is not registered in database '%s'", get_database_name(MyDatabaseId));
 	}
 
@@ -344,6 +432,24 @@ DuckdbMapOid() {
 }
 
 Oid
+DuckdbStructArrayOid() {
+	Assert(cache.valid);
+	return cache.struct_array_oid;
+}
+
+Oid
+DuckdbUnionArrayOid() {
+	Assert(cache.valid);
+	return cache.union_array_oid;
+}
+
+Oid
+DuckdbMapArrayOid() {
+	Assert(cache.valid);
+	return cache.map_array_oid;
+}
+
+Oid
 DuckdbJsonOid() {
 	Assert(cache.valid);
 	return cache.json_oid;
@@ -355,31 +461,31 @@ DuckdbTableAmOid() {
 	return cache.table_am_oid;
 }
 
-Oid
+bool
 IsDuckdbTable(Form_pg_class relation) {
 	Assert(cache.valid);
 	return relation->relam == pgduckdb::DuckdbTableAmOid();
 }
 
-Oid
+bool
 IsDuckdbTable(Relation relation) {
 	Assert(cache.valid);
 	return IsDuckdbTable(relation->rd_rel);
 }
 
-Oid
+bool
 IsMotherDuckTable(Form_pg_class relation) {
 	Assert(cache.valid);
 	return IsDuckdbTable(relation) && relation->relpersistence == RELPERSISTENCE_PERMANENT;
 }
 
-Oid
+bool
 IsMotherDuckTable(Relation relation) {
 	Assert(cache.valid);
 	return IsMotherDuckTable(relation->rd_rel);
 }
 
-Oid
+bool
 IsDuckdbExecutionAllowed() {
 	Assert(cache.valid);
 	Assert(cache.postgres_role_oid != InvalidOid);

@@ -5,6 +5,11 @@ on:
     tags: ["v*"]
   pull_request:
 
+# Cancel in-progress jobs if a new commit is pushed to the same branch (except for main)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !contains(github.ref, 'main') }}
+
 jobs:
   format:
     runs-on: ubuntu-24.04
@@ -40,19 +45,22 @@ jobs:
           type: Release
         - version: REL_16_STABLE
           type: Release
-        # For PG17 we build DuckDB as a static library. There's nothing special
-        # about the static library, nor PG17. This is only done so that we have
+        - version: REL_17_STABLE
+          type: Release
+        # For PG18 we build DuckDB as a static library. There's nothing special
+        # about the static library, nor PG18. This is only done so that we have
         # CI coverage for our logic to build a static library version.
-        - version: REL_17_STABLE
+        - version: REL_18_STABLE
           type: ReleaseStatic
-        - version: REL_17_STABLE
+        - version: REL_18_STABLE
           type: Debug
-
-        # Not enabled for now (waiting for April 2025 code freeze)
-        # - version: master
-        #   type: Release
+        - version: REL_19_STABLE
+          type: Release
 
     runs-on: ubuntu-24.04
+
+    env:
+      PG_MAX_VER: "19"
 
     steps:
       - name: Test details
@@ -64,7 +72,7 @@ jobs:
           sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys E298A3A825C0D65DFD57CBB651716619E084DAB9
           sudo apt-get install -y build-essential libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev \
             libssl-dev libxml2-utils xsltproc pkg-config libc++-dev libc++abi-dev libglib2.0-dev libtinfo6 cmake \
-            libstdc++-12-dev ninja-build
+            libstdc++-12-dev ninja-build libcurl4-openssl-dev
           echo "${PWD}/postgres/inst/bin:$PATH'" > $GITHUB_PATH
 
       - name: ccache
@@ -142,7 +150,9 @@ jobs:
 
       - name: Print regression.diffs if regression tests failed
         if: failure() && steps.installcheck.outcome == 'failure'
-        run: cat duckdb/test/regression/regression.diffs
+        # Always "fail" this task by adding "&& false", so that rits output
+        # gets expanded in the github UI.
+        run: cat duckdb/test/regression/regression.diffs && false
 
       - name: Print postmaster.log if regression tests failed
         if: failure() && steps.installcheck.outcome == 'failure'

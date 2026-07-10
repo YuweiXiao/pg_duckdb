@@ -15,6 +15,12 @@ INSERT INTO int_array_1d SELECT CAST(a as INT[]) FROM (VALUES
 ) t(a);
 SELECT * FROM int_array_1d;
 
+SET duckdb.log_pg_explain = true;
+SELECT * FROM int_array_1d WHERE a @> ARRAY[4];
+
+SELECT * FROM duckdb.query($$ FROM pgduckdb.public.int_array_1d WHERE contains(a, 4) $$);
+RESET duckdb.log_pg_explain;
+
 -- INT4 (two dimensional data, single dimension type)
 CREATE TABLE int_array_2d(a INT[]);
 INSERT INTO int_array_2d VALUES
@@ -174,6 +180,9 @@ INSERT INTO numeric_array_1d SELECT CAST(a as NUMERIC[]) FROM (VALUES
     ('{}')
 ) t(a);
 SELECT * FROM numeric_array_1d;
+SET duckdb.convert_unsupported_numeric_to_double = true;
+SELECT * FROM numeric_array_1d;
+RESET duckdb.convert_unsupported_numeric_to_double;
 
 -- UUID (single dimension)
 CREATE TABLE uuid_array_1d(a UUID[]);
@@ -338,6 +347,9 @@ INSERT INTO numeric_array_2d VALUES
     ('{}'),
     ('{{11.1,12.2},{NULL,14.4}}');
 SELECT * FROM numeric_array_2d;
+SET duckdb.convert_unsupported_numeric_to_double = true;
+SELECT * FROM numeric_array_2d;
+RESET duckdb.convert_unsupported_numeric_to_double;
 
 -- UUID (two dimensions)
 CREATE TABLE uuid_array_2d(a UUID[][]);
@@ -358,6 +370,55 @@ INSERT INTO regclass_array_2d VALUES
     ('{}'),
     ('{{"pg_database","pg_tablespace"},{NULL,"pg_auth_members"}}');
 SELECT * FROM regclass_array_2d;
+
+-- Complex DuckDB array types testing
+
+-- STRUCT arrays
+SELECT * FROM duckdb.query($$
+SELECT
+    [{'name': 'Alice', 'age': 30}, {'name': 'Bob', 'age': 25}] as people_array,
+    [{'name': 'Charlie', 'age': 35}] as single_person,
+    CAST([] AS STRUCT(name VARCHAR, age INTEGER)[]) as empty_array
+$$);
+
+-- UNION arrays
+SELECT * FROM duckdb.query($$
+SELECT
+    [union_value(str := 'hello'), union_value(str := 'world')] as string_union_array,
+    [union_value(num := 42), union_value(num := 100)] as number_union_array,
+    [CAST(union_value(num := 42) AS UNION(str VARCHAR, num INTEGER)), union_value(str := 'a100')] as mixed_union_array,
+    CAST([] AS UNION(str VARCHAR, num INTEGER)[]) as empty_union_array
+$$);
+
+-- MAP arrays
+SELECT * FROM duckdb.query($$
+SELECT
+    [map(['key1', 'key2'], [10, 20]), map(['a'], [100])] as map_array,
+    [map(['x', 'y', 'z'], [1, 2, 3])] as single_map,
+    CAST([] AS MAP(VARCHAR, INTEGER)[]) as empty_map_array
+$$);
+
+CREATE TABLE text_array_ctas AS SELECT * FROM duckdb.query($$
+    SELECT ['box office', 'hollywood', '2025 Predictions', 'Movies', 'Culture', 'Best of 2025'] as tags
+$$);
+
+CREATE TABLE json_array_ctas AS SELECT * FROM duckdb.query($$
+    SELECT [{'key': 'value'}, {'foo': 'bar'}]::JSON[] as data
+$$);
+
+SELECT * FROM text_array_ctas;
+SELECT * FROM json_array_ctas;
+
+-- Check column types
+SELECT attname, atttypid::regtype
+FROM pg_attribute
+WHERE attrelid IN ('text_array_ctas'::regclass, 'json_array_ctas'::regclass)
+  AND attnum > 0
+ORDER BY attrelid::regclass::text, attname;
+
+-- This was crashing before treating DuckDB varchar array as text array
+ANALYZE text_array_ctas;
+ANALYZE json_array_ctas;
 
 -- Cleanup
 DROP TABLE int_array_0d;
@@ -380,6 +441,8 @@ DROP TABLE numeric_array_1d;
 DROP TABLE uuid_array_1d;
 DROP TABLE json_array_1d;
 DROP TABLE jsonb_array_1d;
+DROP TABLE text_array_ctas;
+DROP TABLE json_array_ctas;
 DROP TABLE regclass_array_1d;
 DROP TABLE char_array_2d;
 DROP TABLE smallint_array_2d;

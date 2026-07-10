@@ -13,11 +13,11 @@ EXPLAIN SELECT count(*) FROM ta;
  │        count_star()       │
  └─────────────┬─────────────┘
  ┌─────────────┴─────────────┐
- │  PGDUCKDB_POSTGRES_SCAN   │
+ │   PGDUCKDB_POSTGRES_SCAN  │
  │    ────────────────────   │
  │         Table: ta         │
  │                           │
- │         ~2550 Rows        │
+ │        ~2,550 rows        │
  └───────────────────────────┘
  
  
@@ -37,11 +37,11 @@ EXPLAIN SELECT count(*) FROM ta;
  │        count_star()       │
  └─────────────┬─────────────┘
  ┌─────────────┴─────────────┐
- │  PGDUCKDB_POSTGRES_SCAN   │
+ │   PGDUCKDB_POSTGRES_SCAN  │
  │    ────────────────────   │
  │         Table: ta         │
  │                           │
- │         ~2550 Rows        │
+ │        ~2,550 rows        │
  └───────────────────────────┘
  
  

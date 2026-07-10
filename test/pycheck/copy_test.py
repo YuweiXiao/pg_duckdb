@@ -1,9 +1,10 @@
-from .utils import Cursor
-
-import pytest
-import psycopg.errors
-from pathlib import Path
 import json
+from pathlib import Path
+
+import psycopg.errors
+import pytest
+
+from .utils import Cursor
 
 
 def test_copy_to_local(cur: Cursor, tmp_path: Path):
@@ -21,20 +22,27 @@ def test_copy_to_local(cur: Cursor, tmp_path: Path):
     with open(csv_path, "r") as file:
         content = file.read()
         expected_content = "id,name\n1,Alice\n2,Bob\n"
-        assert (
-            content == expected_content
-        ), f"Expected: {expected_content}, but got: {content}"
+        assert content == expected_content, (
+            f"Expected: {expected_content}, but got: {content}"
+        )
 
     # The above was using duckdb exection because duckdb.force_execution is
     # true by default in our tests. We can validate that by looking at the
     # error message.
     with pytest.raises(
         psycopg.errors.InternalError,
-        match='Binder Error: Unrecognized option CSV writer "unknown_option"',
+        match='Not implemented Error: Unrecognized option "unknown_option" for csv',
     ):
         cur.sql(
             f"COPY test_table TO '{csv_path}' WITH (FORMAT CSV, UNKNOWN_OPTION true)"
         )
+
+    # copying to relative paths is not allowed though, in accordance with
+    # Postgres behaviour to avoid overwriting datababase file accidentally.
+    with pytest.raises(
+        psycopg.errors.InvalidName, match="relative path not allowed for COPY to file"
+    ):
+        cur.sql("COPY test_table TO 'test_copy.csv' WITH (FORMAT CSV)")
 
     # Disabling duckdb.force_execution makes the query fail with a different
     # error.
@@ -55,6 +63,14 @@ def test_copy_to_local(cur: Cursor, tmp_path: Path):
         (1, "Alice"),
         (2, "Bob"),
     ]
+
+    # Again relative paths are not allowed for COPY TO, this becomes an
+    # internal error though, due to our failure to propagate error codes
+    # correctly.
+    with pytest.raises(
+        psycopg.errors.InternalError, match="relative path not allowed for COPY to file"
+    ):
+        cur.sql("COPY test_table TO 'test_copy.parquet' WITH (FORMAT PARQUET)")
 
     # We can copy the result of a DuckDB query using Postgres its COPY logic
     cur.sql(
@@ -196,3 +212,27 @@ def test_copy_from_local(cur: Cursor, tmp_path: Path):
         match="pg_duckdb does not support COPY ... FROM ... yet for Postgres tables",
     ):
         cur.sql(f"COPY pg_table FROM '{parquet_path}' WITH (FORMAT PARQUET)")
+
+    # Non-SELECT queries fall back to the Postgres COPY logic if we're not
+    # using DuckDB features.
+    cur.sql(f"COPY (INSERT INTO pg_table VALUES (42) RETURNING (id)) TO '{csv_path}'")
+    assert cur.sql(f"select * from read_csv('{csv_path}')") == 42
+    cur.sql(f"COPY (INSERT INTO duck_table VALUES (43) RETURNING (id)) TO '{csv_path}'")
+    assert cur.sql(f"select * from read_csv('{csv_path}')") == 43
+
+    # If that's not possible (e.g. due to parquet), then we throw a clear error
+    with pytest.raises(
+        psycopg.errors.InternalError,
+        match="DuckDB does not support modifying Postgres tables",
+    ):
+        cur.sql(
+            f"COPY (INSERT INTO pg_table VALUES (1) RETURNING (id)) TO '{parquet_path}'"
+        )
+
+    with pytest.raises(
+        psycopg.errors.InternalError,
+        match="DuckDB COPY only supports SELECT statement",
+    ):
+        cur.sql(
+            f"COPY (INSERT INTO duck_table VALUES (1) RETURNING (id)) TO '{parquet_path}'"
+        )

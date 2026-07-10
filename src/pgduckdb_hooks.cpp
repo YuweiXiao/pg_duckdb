@@ -2,6 +2,7 @@
 
 #include "pgduckdb/pgduckdb_planner.hpp"
 #include "pgduckdb/pg/transactions.hpp"
+#include "pgduckdb/pg/explain.hpp"
 #include "pgduckdb/pgduckdb_xact.hpp"
 #include "pgduckdb/pgduckdb_hooks.hpp"
 #include "pgduckdb/pgduckdb_utils.hpp"
@@ -19,12 +20,13 @@ extern "C" {
 #include "tcop/pquery.h"
 #include "utils/rel.h"
 #include "utils/relcache.h"
+#include "utils/lsyscache.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/planner.h"
 }
 
 #include "pgduckdb/pgduckdb.h"
-#include "pgduckdb/pgduckdb_guc.h"
+#include "pgduckdb/pgduckdb_guc.hpp"
 #include "pgduckdb/pgduckdb_metadata_cache.hpp"
 #include "pgduckdb/pgduckdb_ddl.hpp"
 #include "pgduckdb/pgduckdb_table_am.hpp"
@@ -137,6 +139,42 @@ namespace pgduckdb {
 int64_t executor_nest_level = 0;
 
 bool
+ContainsPostgresTable(Node *node, void *context) {
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Query)) {
+		Query *query = (Query *)node;
+		List *rtable = query->rtable;
+		foreach_node(RangeTblEntry, rte, rtable) {
+			if (rte->relid == InvalidOid) {
+				continue;
+			}
+			char relkind = get_rel_relkind(rte->relid);
+			if (relkind == RELKIND_VIEW) {
+				/* Any tables referenced in the view will also be in the rtable */
+				continue;
+			}
+			if (!pgduckdb::IsDuckdbTable(rte->relid)) {
+				return true;
+			}
+		}
+
+#if PG_VERSION_NUM >= 160000
+		return query_tree_walker(query, ContainsPostgresTable, context, 0);
+#else
+		return query_tree_walker(query, (bool (*)())((void *)ContainsPostgresTable), context, 0);
+#endif
+	}
+
+#if PG_VERSION_NUM >= 160000
+	return expression_tree_walker(node, ContainsPostgresTable, context);
+#else
+	return expression_tree_walker(node, (bool (*)())((void *)ContainsPostgresTable), context);
+#endif
+}
+
+bool
 ShouldTryToUseDuckdbExecution(Query *query) {
 	if (top_level_duckdb_ddl_type == DDLType::REFRESH_MATERIALIZED_VIEW) {
 		/* When refreshing materialized views, we only want to use DuckDB
@@ -196,7 +234,7 @@ IsAllowedStatement(Query *query, bool throw_error) {
 		}
 	}
 
-	if (pgduckdb::executor_nest_level > 0) {
+	if (pgduckdb::executor_nest_level > 0 && !duckdb_unsafe_allow_execution_inside_functions) {
 		elog(elevel, "DuckDB execution is not supported inside functions");
 		return false;
 	}
@@ -217,16 +255,21 @@ IsAllowedStatement(Query *query, bool throw_error) {
 } // namespace pgduckdb
 
 static PlannedStmt *
+#if PG_VERSION_NUM >= 190000
+DuckdbPlannerHook_Cpp(Query *parse, const char *query_string, int cursor_options, ParamListInfo bound_params,
+                      ExplainState *es) {
+#else
 DuckdbPlannerHook_Cpp(Query *parse, const char *query_string, int cursor_options, ParamListInfo bound_params) {
+#endif
 	if (pgduckdb::IsExtensionRegistered()) {
 		if (pgduckdb::NeedsDuckdbExecution(parse)) {
 			pgduckdb::TriggerActivity();
 			pgduckdb::IsAllowedStatement(parse, true);
 
-			return DuckdbPlanNode(parse, query_string, cursor_options, bound_params, true);
+			return DuckdbPlanNode(parse, cursor_options, true);
 		} else if (pgduckdb::ShouldTryToUseDuckdbExecution(parse)) {
 			pgduckdb::TriggerActivity();
-			PlannedStmt *duckdbPlan = DuckdbPlanNode(parse, query_string, cursor_options, bound_params, false);
+			PlannedStmt *duckdbPlan = DuckdbPlanNode(parse, cursor_options, false);
 			if (duckdbPlan) {
 				return duckdbPlan;
 			}
@@ -247,15 +290,26 @@ DuckdbPlannerHook_Cpp(Query *parse, const char *query_string, int cursor_options
 
 	pgduckdb::MarkStatementNotTopLevel();
 
+#if PG_VERSION_NUM >= 190000
+	return prev_planner_hook(parse, query_string, cursor_options, bound_params, es);
+#else
 	return prev_planner_hook(parse, query_string, cursor_options, bound_params);
+#endif
 }
 
 static PlannedStmt *
+#if PG_VERSION_NUM >= 190000
+DuckdbPlannerHook(Query *parse, const char *query_string, int cursor_options, ParamListInfo bound_params,
+                  ExplainState *es) {
+	return InvokeCPPFunc(DuckdbPlannerHook_Cpp, parse, query_string, cursor_options, bound_params, es);
+}
+#else
 DuckdbPlannerHook(Query *parse, const char *query_string, int cursor_options, ParamListInfo bound_params) {
 	return InvokeCPPFunc(DuckdbPlannerHook_Cpp, parse, query_string, cursor_options, bound_params);
 }
+#endif
 
-bool
+static bool
 IsDuckdbPlan(PlannedStmt *stmt) {
 	Plan *plan = stmt->planTree;
 	if (!plan) {
@@ -326,6 +380,7 @@ DuckdbExecutorStartHook(QueryDesc *queryDesc, int eflags) {
 	}
 
 	prev_executor_start_hook(queryDesc, eflags);
+
 	InvokeCPPFunc(DuckdbExecutorStartHook_Cpp, queryDesc);
 }
 
@@ -362,7 +417,7 @@ DuckdbExecutorFinishHook(QueryDesc *queryDesc) {
 	InvokeCPPFunc(DuckdbExecutorFinishHook_Cpp, queryDesc);
 }
 
-void
+static void
 DuckdbExplainOneQueryHook(Query *query, int cursorOptions, IntoClause *into, ExplainState *es, const char *queryString,
                           ParamListInfo params, QueryEnvironment *queryEnv) {
 	/*
@@ -376,11 +431,8 @@ DuckdbExplainOneQueryHook(Query *query, int cursorOptions, IntoClause *into, Exp
 	 * EXPLAIN queries are also always re-planned (see
 	 * standard_ExplainOneQuery).
 	 */
-	duckdb_explain_analyze = es->analyze;
-	if (es->format == EXPLAIN_FORMAT_JSON)
-		duckdb_explain_format = duckdb::ExplainFormat::JSON;
-	else
-		duckdb_explain_format = duckdb::ExplainFormat::DEFAULT;
+	duckdb_explain_analyze = pgduckdb::pg::IsExplainAnalyze(es);
+	duckdb_explain_format = pgduckdb::pg::DuckdbExplainFormat(es);
 	duckdb_explain_ctas = into != NULL;
 	prev_explain_one_query_hook(query, cursorOptions, into, es, queryString, params, queryEnv);
 }
@@ -397,6 +449,15 @@ IsOutdatedMotherduckCatalogErrcode(int error_code) {
 	}
 }
 
+static bool
+ContainsDuckdbRowReturningFunction(const char *query_string) {
+	return strstr(query_string, "read_parquet") || strstr(query_string, "read_csv") ||
+	       strstr(query_string, "read_json") || strstr(query_string, "delta_scan") ||
+	       strstr(query_string, "iceberg_scan") || strstr(query_string, "read_vortex") ||
+	       strstr(query_string, "read_text") || strstr(query_string, "read_blob") ||
+	       strstr(query_string, "duckdb.query");
+}
+
 static void
 DuckdbEmitLogHook(ErrorData *edata) {
 	if (prev_emit_log_hook) {
@@ -404,30 +465,25 @@ DuckdbEmitLogHook(ErrorData *edata) {
 	}
 
 	if (edata->elevel == ERROR && edata->sqlerrcode == ERRCODE_UNDEFINED_COLUMN && pgduckdb::IsExtensionRegistered()) {
-		/*
-		 * XXX: It would be nice if we could check if the query contained any
-		 * of the functions. We could probably check the debug_query_string
-		 * global for this. For now we don't consider that too important though.
-		 * So instead we simply always add this HINT for this specific error if
-		 * the pg_duckdb extension is installed.
-		 */
-		edata->hint = pstrdup(
-		    "If you use DuckDB functions like read_parquet, you need to use the r['colname'] syntax to use columns. If "
-		    "you're already doing that, maybe you forgot to to give the function the r alias.");
+		if (ContainsDuckdbRowReturningFunction(debug_query_string)) {
+			edata->hint = pstrdup("If you use DuckDB functions like read_parquet, you need to use the r['colname'] "
+			                      "syntax to use columns. If "
+			                      "you're already doing that, maybe you forgot to give the function the r alias.");
+		}
 	} else if (edata->elevel == ERROR && edata->sqlerrcode == ERRCODE_SYNTAX_ERROR &&
 	           pgduckdb::IsExtensionRegistered() &&
 	           strcmp(edata->message_id,
 	                  "a column definition list is only allowed for functions returning \"record\"") == 0) {
-		/*
-		 * NOTE: We can probably remove this hint after a few releases once
-		 * we've updated all known blogposts that still used the old syntax.
-		 *
-		 * Similarly to the other hint, this could check for actual usages of
-		 * the relevant DuckDB functions.
-		 */
-		edata->hint = pstrdup(
-		    "If you use DuckDB functions like read_parquet, you need to use the r['colname'] syntax introduced "
-		    "in pg_duckdb 0.3.0. It seems like you might be using the outdated \"AS (colname coltype, ...)\" syntax");
+		if (ContainsDuckdbRowReturningFunction(debug_query_string)) {
+			/*
+			 * NOTE: We can probably remove this hint after a few releases once
+			 * we've updated all known blogposts that still used the old syntax.
+			 */
+			edata->hint = pstrdup(
+			    "If you use DuckDB functions like read_parquet, you need to use the r['colname'] syntax introduced "
+			    "in pg_duckdb 0.3.0. It seems like you might be using the outdated \"AS (colname coltype, ...)\" "
+			    "syntax");
+		}
 	}
 
 	/*

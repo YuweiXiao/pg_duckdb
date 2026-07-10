@@ -24,9 +24,12 @@ public:
 		return manager_instance;
 	}
 
-	static inline DuckDBManager *
-	FindIfInitialized() {
-		return manager_instance.database ? &manager_instance : nullptr;
+	static void
+	InvalidateDuckDBSecretsIfInitialized() {
+		// Only invalidate the secrets if the database is initialized.
+		if (IsInitialized()) {
+			manager_instance.InvalidateDuckDBSecrets();
+		}
 	}
 
 	static duckdb::unique_ptr<duckdb::Connection> CreateConnection();
@@ -48,10 +51,16 @@ public:
 		return *database;
 	}
 
-	void Reset();
+	static void Reset();
 
 private:
-	DuckDBManager() = default;
+	DuckDBManager()
+	    : extensions_table_current_seq(0), database(nullptr), connection(nullptr), default_dbname("<!UNSET!>"),
+	      secrets_valid(false) {
+	}
+
+	DuckDBManager(const DuckDBManager &) = delete;
+	DuckDBManager &operator=(const DuckDBManager &) = delete;
 
 	static DuckDBManager manager_instance;
 
@@ -62,6 +71,7 @@ private:
 	void LoadSecrets(duckdb::ClientContext &);
 	void DropSecrets(duckdb::ClientContext &);
 	void LoadExtensions(duckdb::ClientContext &);
+	void InstallExtensions(duckdb::ClientContext &);
 	void LoadFunctions(duckdb::ClientContext &);
 	void RefreshConnectionState(duckdb::ClientContext &);
 

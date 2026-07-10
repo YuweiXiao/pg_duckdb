@@ -113,6 +113,24 @@ CREATE TEMP TABLE t(A text COMPRESSION "pglz");
 
 CREATE TEMP TABLE t(a int) WITH (fillfactor = 50);
 
+-- Should fail because user should specify the precision of the NUMERIC.
+CREATE TEMP TABLE large_numeric_tbl (a NUMERIC) USING duckdb;
+-- But it's fine if the user specifies the precision
+CREATE TEMP TABLE large_numeric_tbl_specified (a NUMERIC(38,20)) USING duckdb;
+-- CTAS is fine though, it will use duckdb its default
+-- TODO: Maybe make this fail too for consistency?
+CREATE TEMP TABLE duckdb_numeric_from_pg_bare USING duckdb AS select 1::numeric x;
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'duckdb_numeric_from_pg_bare'::regclass AND attname = 'x';
+-- Except if they are fully specified
+CREATE TEMP TABLE duckdb_numeric_from_pg USING duckdb AS select 1::numeric(10,8) x;
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'duckdb_numeric_from_pg'::regclass AND attname = 'x';
+-- Same when the query is forced by duckdb
+CREATE TEMP TABLE duckdb_numeric_bare USING duckdb AS select * from duckdb.query($$ select 1::numeric x $$);
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'duckdb_numeric_bare'::regclass AND attname = 'x';
+-- But CTAS with numerics coming from a duckdb query are fine (i.e. we pass on the precision that duckdb uses)
+CREATE TEMP TABLE duckdb_numeric USING duckdb AS select * from duckdb.query($$ select 1::numeric(10, 5) x $$);
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'duckdb_numeric'::regclass AND attname = 'x';
+
 CREATE TEMP TABLE cities_duckdb (
   name       text,
   population real,
@@ -279,4 +297,15 @@ select * from duckdb.query( $$ describe pg_temp.ta $$ );
 
 SELECT * FROM ta;
 
-DROP TABLE webpages, t, t_heap, t_heap2, t_heap3, ta, tb, tc, td;
+CREATE TEMP TABLE measurement (
+    city_id         int not null,
+    logdate         date not null,
+    peaktemp        int,
+    unitsales       int
+) PARTITION BY RANGE (logdate);
+
+-- This command should fail because we don't support duckdb partitions yet
+CREATE TEMP TABLE measurement_y2006m02 PARTITION OF measurement
+    FOR VALUES FROM ('2006-02-01') TO ('2006-03-01') USING duckdb;
+
+DROP TABLE webpages, t, t_heap, t_heap2, t_heap3, ta, tb, tc, td, measurement;

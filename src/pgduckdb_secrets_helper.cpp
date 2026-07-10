@@ -6,6 +6,8 @@
 #include "pgduckdb/utility/cpp_wrapper.hpp"
 #include "pgduckdb/pgduckdb_duckdb.hpp"
 
+#include "pgduckdb/pgduckdb_xact.hpp"
+
 extern "C" {
 #include "postgres.h"
 
@@ -49,21 +51,12 @@ GetOption(List *options_list, const char *name) {
 
 namespace {
 
-bool
+void
 appendOptions(StringInfoData &buf, List *options) {
-	bool first = true;
 	foreach_node(DefElem, def, options) {
-		if (first) {
-			first = false;
-		} else {
-			appendStringInfoString(&buf, ", ");
-		}
-
 		// No need to sanitize option's name since it went through PG's validation
-		appendStringInfo(&buf, "%s %s", def->defname, quote_literal_cstr(defGetString(def)));
+		appendStringInfo(&buf, ", %s %s", def->defname, quote_literal_cstr(defGetString(def)));
 	}
-
-	return !first;
 }
 
 char *
@@ -73,19 +66,15 @@ MakeDuckDBCreateSecretQuery(const char *server_name, const char *type, List *ser
 	initStringInfo(&buf);
 	appendStringInfo(&buf, "CREATE SECRET pgduckdb_secret_%s (", server_name);
 
-	bool appended_options = appendOptions(buf, server_options);
+	appendStringInfo(&buf, "TYPE %s", type);
+
+	appendOptions(buf, server_options);
 	if (list_length(mapping_options) > 0) {
-		if (appended_options) {
-			appendStringInfoString(&buf, ", ");
-		}
-		appended_options = appendOptions(buf, mapping_options);
+		appendOptions(buf, mapping_options);
 	}
 
-	if (appended_options) {
-		appendStringInfoString(&buf, ", ");
-	}
+	appendStringInfoString(&buf, ")");
 
-	appendStringInfo(&buf, "TYPE %s)", type);
 	return buf.data;
 }
 
@@ -94,6 +83,7 @@ MakeDuckDBCreateSecretQuery(const char *server_name, const char *type, List *ser
 List *
 ListDuckDBCreateSecretQueries() {
 	MemoryContext entry_ctx = CurrentMemoryContext;
+	bool was_top_level_statement = pgduckdb::IsStatementTopLevel();
 	SPI_connect();
 
 	// List all SERVER created with 'duckdb' FDW
@@ -142,6 +132,7 @@ ListDuckDBCreateSecretQueries() {
 	}
 
 	SPI_finish();
+	pgduckdb::SetStatementTopLevel(was_top_level_statement);
 	return results;
 }
 
@@ -184,7 +175,7 @@ FindUserMapping(Oid userid, Oid serverid, bool with_options) {
 	return um;
 }
 
-const char *
+static const char *
 GetQueryError(const char *query, List *server_options) {
 	// Create a new connection on the DB so we can create the secret and rollback without modifying the transaction
 	// state of the main connection.

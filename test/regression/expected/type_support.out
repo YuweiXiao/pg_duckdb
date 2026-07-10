@@ -326,6 +326,25 @@ INSERT INTO numeric_as_double SELECT a FROM (VALUES
     (NULL),
     (458234502034234234234.000012)
 ) t(a);
+-- Should fail
+SELECT * FROM numeric_as_double;
+WARNING:  (PGDuckDB/CreatePlan) Prepared query returned an error: Not implemented Error: Unsupported PostgreSQL type found in query: DuckDB requires the precision of a NUMERIC to be set. You can choose to convert these NUMERICs to a DOUBLE by using 'SET duckdb.convert_unsupported_numeric_to_double = true'
+              a               
+------------------------------
+                  0.234234234
+                             
+ 458234502034234234234.000012
+(3 rows)
+
+-- Expressions involving such columns should also fail
+SELECT 'yes' FROM numeric_as_double WHERE a > 10;
+WARNING:  (PGDuckDB/CreatePlan) Prepared query returned an error: Not implemented Error: Unsupported PostgreSQL type found in query: DuckDB requires the precision of a NUMERIC to be set. You can choose to convert these NUMERICs to a DOUBLE by using 'SET duckdb.convert_unsupported_numeric_to_double = true'
+ ?column? 
+----------
+ yes
+(1 row)
+
+SET duckdb.convert_unsupported_numeric_to_double = true;
 SELECT * FROM numeric_as_double;
            a           
 -----------------------
@@ -334,6 +353,7 @@ SELECT * FROM numeric_as_double;
  4.582345020342342e+20
 (3 rows)
 
+RESET duckdb.convert_unsupported_numeric_to_double;
 -- NUMERIC with a physical type of SMALLINT
 CREATE TABLE smallint_numeric(a NUMERIC(4, 2));
 INSERT INTO smallint_numeric SELECT a FROM (VALUES

@@ -41,9 +41,9 @@ SELECT jsoncol[1], arraycol[2] FROM (
     SELECT r['jsoncol'] jsoncol, r['arraycol'] arraycol
     FROM read_parquet('../../data/indexable.parquet') r
 ) q;
- jsoncol | arraycol 
----------+----------
- "d"     |       22
+ jsoncol[1] | arraycol[2] 
+------------+-------------
+ "d"        |          22
 (1 row)
 
 -- And the same for slice subscripts
@@ -57,8 +57,8 @@ SELECT arraycol[1:2] FROM (
     SELECT r['arraycol'] arraycol
     FROM read_parquet('../../data/indexable.parquet') r
 ) q;
- arraycol 
-----------
+ arraycol[1:2] 
+---------------
  {11,22}
 (1 row)
 
@@ -72,8 +72,8 @@ SELECT arraycol[:] FROM (
     SELECT r['arraycol'] arraycol
     FROM read_parquet('../../data/indexable.parquet') r
 ) q;
-  arraycol  
-------------
+ arraycol[:] 
+-------------
  {11,22,33}
 (1 row)
 
@@ -89,7 +89,7 @@ SELECT * FROM (
 (1 row)
 
 -- NOTE: A single "r" is equivalent to a *. The prefix and postfix columns are
--- not explicitely selected, but still show up in the result. This is
+-- not explicitly selected, but still show up in the result. This is
 -- considered a bug, but it's one that we cannot easily solve because the "r"
 -- reference does not exist in the DuckDB query at all, so there's no way to
 -- reference only the columns coming from that part of the subquery. Very few
@@ -310,6 +310,22 @@ ERROR:  a column definition list is only allowed for functions returning "record
 LINE 1: ... FROM read_parquet('../../data/iris.parquet') AS ("sepal.len...
                                                              ^
 HINT:  If you use DuckDB functions like read_parquet, you need to use the r['colname'] syntax introduced in pg_duckdb 0.3.0. It seems like you might be using the outdated "AS (colname coltype, ...)" syntax
+-- But we don't show that hint for queries that don't use these functions.
+SELECT count("sepal.length") FROM generate_series(1, 100) AS ("sepal.length" FLOAT);
+ERROR:  a column definition list is only allowed for functions returning "record"
+LINE 1: ...("sepal.length") FROM generate_series(1, 100) AS ("sepal.len...
+                                                             ^
+-- Show a hint for users trying to use columns as normal instead of using r['column_name']
+SELECT count("sepal.length") FROM read_parquet('../../data/iris.parquet');
+ERROR:  column "sepal.length" does not exist
+LINE 1: SELECT count("sepal.length") FROM read_parquet('../../data/i...
+                     ^
+HINT:  If you use DuckDB functions like read_parquet, you need to use the r['colname'] syntax to use columns. If you're already doing that, maybe you forgot to give the function the r alias.
+-- But again only show it when we use functions that return duckdb.rows
+SELECT count("sepal.length") FROM generate_series(1, 100) a(x);
+ERROR:  column "sepal.length" does not exist
+LINE 1: SELECT count("sepal.length") FROM generate_series(1, 100) a(...
+                     ^
 -- read_csv
 SELECT count(r['sepal.length']) FROM read_csv('../../data/iris.csv') r;
  count 
@@ -340,7 +356,10 @@ SELECT r['sepal.length'], r['filename']
 (5 rows)
 
 SELECT * FROM read_csv('../../non-existing-file.csv');
-ERROR:  (PGDuckDB/CreatePlan) Prepared query returned an error: 'IO Error: No files found that match the pattern "../../non-existing-file.csv"
+ERROR:  (PGDuckDB/CreatePlan) Prepared query returned an error: IO Error: No files found that match the pattern "../../non-existing-file.csv"
+
+LINE 1: SELECT read_csv.* FROM system.main.read_csv('../../non-existing-file.csv'::text...
+                               ^
 -- We override Postgres its default column name for subscript expressions. In
 -- the following example the column would normally be named "r", which is
 -- pretty non-descriptive especially when selecting multiple columns from the
@@ -463,7 +482,7 @@ LIMIT 1;
  1520873.7806
 (1 row)
 
-SELECT * FROM iceberg_snapshots('../../data/lineitem_iceberg');
+SELECT * FROM iceberg_snapshots('../../data/lineitem_iceberg') ORDER BY sequence_number;
  sequence_number |     snapshot_id     |         timestamp_ms         |                                         manifest_list                                          
 -----------------+---------------------+------------------------------+------------------------------------------------------------------------------------------------
                1 | 3776207205136740581 | Wed Feb 15 15:07:54.504 2023 | lineitem_iceberg/metadata/snap-3776207205136740581-1-cf3d0be5-cf70-453d-ad8f-48fdc412e608.avro
@@ -494,5 +513,75 @@ SELECT r['a'], r['b'], r['c'] FROM read_json('../../data/table.json') r WHERE r[
  a  |    b    |  c   
 ----+---------+------
  50 | json_50 | 50.5
+(1 row)
+
+-- read_vortex
+SELECT duckdb.install_extension('vortex');
+ install_extension 
+-------------------
+ 
+(1 row)
+
+SELECT count(r['sepal.length']) FROM read_vortex('../../data/iris.vortex') r;
+ count 
+-------
+   150
+(1 row)
+
+SELECT r['sepal.length'] FROM read_vortex('../../data/iris.vortex') r ORDER BY r['sepal.length']  LIMIT 5;
+ sepal.length 
+--------------
+          4.3
+          4.4
+          4.4
+          4.4
+          4.5
+(5 rows)
+
+-- array of paths
+SELECT count(*) FROM read_vortex(ARRAY['../../data/iris.vortex', '../../data/iris.vortex']) r;
+ count 
+-------
+   300
+(1 row)
+
+-- read_text
+SELECT r['size'] FROM read_text('../../data/table.json') r;
+ size 
+------
+ 3176
+(1 row)
+
+SELECT length(r['content']) FROM read_text('../../data/table.json') r;
+ length 
+--------
+   3176
+(1 row)
+
+-- array of paths
+SELECT count(*) FROM read_text(ARRAY['../../data/table.json', '../../data/table.json']) r;
+ count 
+-------
+     2
+(1 row)
+
+-- read_blob
+SELECT r['size'] FROM read_blob('../../data/table.json') r;
+ size 
+------
+ 3176
+(1 row)
+
+SELECT octet_length(r['content']::bytea) FROM read_blob('../../data/table.json') r;
+ octet_length 
+--------------
+         3176
+(1 row)
+
+-- array of paths
+SELECT count(*) FROM read_blob(ARRAY['../../data/table.json']) r;
+ count 
+-------
+     1
 (1 row)
 

@@ -11,6 +11,7 @@
 extern "C" {
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "access/xact.h"
 #include "access/table.h"
 #include "catalog/pg_type.h"
@@ -28,8 +29,14 @@ extern "C" {
 #include "utils/rel.h"
 #include "utils/syscache.h"
 #include "utils/guc.h"
+#include "parser/parse_relation.h"
+#include "utils/acl.h"
+#include "utils/lsyscache.h"
+#include "utils/rel.h"
 
 #include "pgduckdb/pgduckdb_ruleutils.h"
+
+#include "executor/executor.h"
 }
 
 #include "pgduckdb/pg/types.hpp"
@@ -37,7 +44,7 @@ extern "C" {
 #include "pgduckdb/pgduckdb_node.hpp"
 #include "pgduckdb/vendor/pg_list.hpp"
 #include "pgduckdb/utility/cpp_wrapper.hpp"
-#include "pgduckdb/pgduckdb_guc.h"
+#include "pgduckdb/pgduckdb_guc.hpp"
 #include "pgduckdb/pgduckdb_types.hpp"
 
 static bool
@@ -62,7 +69,8 @@ IsAllowedPostgresInsert(Query *query, bool throw_error) {
 
 	int elevel = throw_error ? ERROR : DEBUG4;
 	if (query->commandType != CMD_INSERT) {
-		elog(duckdb_log_pg_explain ? NOTICE : elevel, "DuckDB only supports INSERT/SELECT on Postgres tables");
+		elog(pgduckdb::duckdb_log_pg_explain ? NOTICE : elevel,
+		     "DuckDB only supports INSERT/SELECT on Postgres tables");
 		return false;
 	}
 
@@ -81,7 +89,7 @@ IsAllowedPostgresInsert(Query *query, bool throw_error) {
 	}
 
 	if (!select_rte) {
-		elog(duckdb_log_pg_explain ? NOTICE : elevel, "DuckDB does not support INSERT without a subquery");
+		elog(pgduckdb::duckdb_log_pg_explain ? NOTICE : elevel, "DuckDB does not support INSERT without a subquery");
 		return false;
 	}
 
@@ -90,7 +98,8 @@ IsAllowedPostgresInsert(Query *query, bool throw_error) {
 	 * DuckDB, such as differences in bytea representation and numeric rounding.
 	 */
 	if (ContainValueRTE(select_rte->subquery)) {
-		elog(duckdb_log_pg_explain ? NOTICE : elevel, "DuckDB does not support INSERTs with value subqueries");
+		elog(pgduckdb::duckdb_log_pg_explain ? NOTICE : elevel,
+		     "DuckDB does not support INSERTs with value subqueries");
 		return false;
 	}
 
@@ -108,8 +117,8 @@ IsAllowedPostgresInsert(Query *query, bool throw_error) {
 		 * is implemented.
 		 */
 		auto duckdb_col_type = pgduckdb::ConvertPostgresToDuckColumnType(attr);
-		if (duckdb_col_type.id() == duckdb::LogicalTypeId::USER) {
-			elog(duckdb_log_pg_explain ? NOTICE : elevel,
+		if (duckdb_col_type.id() == duckdb::LogicalTypeId::INVALID) {
+			elog(pgduckdb::duckdb_log_pg_explain ? NOTICE : elevel,
 			     "DuckDB does not support INSERTs into tables with column `%s` of unsupported type (OID %u). ",
 			     NameStr(attr->attname), attr->atttypid);
 			ret = false;
@@ -213,7 +222,7 @@ CreatePlan(Query *query, bool throw_error) {
 	duckdb::unique_ptr<duckdb::PreparedStatement> prepared_query = DuckdbPrepare(query);
 
 	if (prepared_query->HasError()) {
-		elog(elevel, "(PGDuckDB/CreatePlan) Prepared query returned an error: '%s", prepared_query->GetError().c_str());
+		elog(elevel, "(PGDuckDB/CreatePlan) Prepared query returned an error: %s", prepared_query->GetError().c_str());
 		return nullptr;
 	}
 
@@ -222,10 +231,9 @@ CreatePlan(Query *query, bool throw_error) {
 	auto &prepared_result_types = prepared_query->GetTypes();
 
 	for (size_t i = 0; i < prepared_result_types.size(); i++) {
-		Oid postgresColumnOid = pgduckdb::GetPostgresDuckDBType(prepared_result_types[i]);
+		Oid postgresColumnOid = pgduckdb::GetPostgresDuckDBType(prepared_result_types[i], throw_error);
 
 		if (!OidIsValid(postgresColumnOid)) {
-			elog(elevel, "(PGDuckDB/CreatePlan) Cache lookup failed for type %u", postgresColumnOid);
 			return nullptr;
 		}
 
@@ -239,13 +247,15 @@ CreatePlan(Query *query, bool throw_error) {
 		}
 
 		typtup = (Form_pg_type)GETSTRUCT(tp);
+		typtup->typtypmod = pgduckdb::GetPostgresDuckDBTypemod(prepared_result_types[i]);
 
-		/* We fill in the varno later, once we know the index of the custom RTE
-		 * that we create. We'll know this at the end of DuckdbPlanNode. This
-		 * can probably be simplified when we don't call the standard_planner
-		 * anymore inside DuckdbPlanNode, because then we only need a single
-		 * RTE. */
-		Var *var = makeVar(0, i + 1, postgresColumnOid, typtup->typtypmod, typtup->typcollation, 0);
+		/*
+		 * We hardcode varno 1 here, because our final plan will only have a
+		 * single RTE (this custom scan). In the past we put 0 here, and then
+		 * filled it in later. If at some point we need multiple RTEs again, we
+		 * might want to start doing that again.
+		 */
+		Var *var = makeVar(1, i + 1, postgresColumnOid, typtup->typtypmod, typtup->typcollation, 0);
 
 		TargetEntry *target_entry =
 		    makeTargetEntry((Expr *)var, i + 1, (char *)pstrdup(prepared_query->GetNames()[i].c_str()), false);
@@ -362,9 +372,56 @@ CoerceTargetList(List *duckdb_targetlist, TupleDesc pg_tupdesc) {
 	return ret;
 }
 
+static void
+check_view_perms_recursive(Query *query) {
+	ListCell *lc;
+
+	if (query == NULL) {
+		return;
+	}
+
+	foreach (lc, query->rtable) {
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+
+#if PG_VERSION_NUM < 160000
+		if (rte->relkind == RELKIND_VIEW) {
+			bool result = ExecCheckRTEPerms(rte);
+			if (!result) {
+				aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_VIEW, get_rel_name(rte->relid));
+			}
+		}
+#else
+		if (rte->perminfoindex != 0 && rte->relkind == RELKIND_VIEW) {
+			RTEPermissionInfo *perminfo = getRTEPermissionInfo(query->rteperminfos, rte);
+			bool result = ExecCheckOneRelPerms(perminfo);
+			if (!result) {
+				aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_VIEW, get_rel_name(perminfo->relid));
+			}
+		}
+#endif
+
+		if (rte->rtekind == RTE_SUBQUERY && rte->subquery) {
+			check_view_perms_recursive(rte->subquery);
+		}
+	}
+
+	if (query->cteList) {
+		ListCell *lc_cte;
+		foreach (lc_cte, query->cteList) {
+			CommonTableExpr *cte = (CommonTableExpr *)lfirst(lc_cte);
+			if (IsA(cte->ctequery, Query)) {
+				check_view_perms_recursive((Query *)cte->ctequery);
+			}
+		}
+	}
+}
+
 PlannedStmt *
-DuckdbPlanNode(Query *parse, const char *query_string, int cursor_options, ParamListInfo bound_params,
-               bool throw_error) {
+DuckdbPlanNode(Query *parse, int cursor_options, bool throw_error) {
+
+	/* Properly check perms if there's a view or WITH statement */
+	check_view_perms_recursive(parse);
+
 	/* We need to check can we DuckDB create plan */
 
 	Plan *duckdb_plan = InvokeCPPFunc(CreatePlan, parse, throw_error);
@@ -383,44 +440,71 @@ DuckdbPlanNode(Query *parse, const char *query_string, int cursor_options, Param
 	}
 
 	/*
-	 * We let postgres generate a basic plan, but then completely overwrite the
-	 * actual plan with our CustomScan node. This is useful to get the correct
-	 * values for all the other many fields of the PlannedStmt.
-	 *
-	 * XXX: The primary reason we did this in the past is so that Postgres
-	 * filled in permInfos and rtable correctly. Those are needed for postgres
-	 * to do its permission checks on the used tables. We do these checks
-	 * inside DuckDB as well, so that's not really necessary anymore. We still
-	 * do this though to get all the other fields filled in correctly. Possibly
-	 * we don't need to do this anymore.
-	 *
-	 * FIXME: For some reason this needs an additional query copy to allow
-	 * re-planning of the query later during execution. But I don't really
-	 * understand why this is needed.
+	 * For INSERTs into Postgres tables only the SELECT source of the INSERT
+	 * runs in DuckDB. We let standard_planner build the normal INSERT plan,
+	 * so that the ModifyTable node and the result relation metadata are all
+	 * filled in correctly, and then replace the plan that produces the rows
+	 * to insert with our CustomScan node.
 	 */
-	Query *copied_query = (Query *)copyObjectImpl(parse);
-	PlannedStmt *postgres_plan = standard_planner(copied_query, query_string, cursor_options, bound_params);
 	if (IsAllowedPostgresInsert(parse)) {
+		Query *copied_query = (Query *)copyObjectImpl(parse);
+		PlannedStmt *postgres_plan = standard_planner(copied_query, NULL, cursor_options, NULL);
 		Assert(IsA(postgres_plan->planTree, ModifyTable));
 		TupleDesc target_desc = ExecTypeFromTL(outerPlan(postgres_plan->planTree)->targetlist);
 		duckdb_plan->targetlist = CoerceTargetList(duckdb_plan->targetlist, target_desc);
 		outerPlan(postgres_plan->planTree) = duckdb_plan;
-	} else {
-		postgres_plan->planTree = duckdb_plan;
+
+		/* Put a DuckDB RTE at the end of the rtable */
+		RangeTblEntry *insert_rte = DuckdbRangeTableEntry(custom_scan);
+		postgres_plan->rtable = lappend(postgres_plan->rtable, insert_rte);
+
+		/*
+		 * CreatePlan hardcodes varno 1 in the custom_scan_tlist, because
+		 * normally our CustomScan is the only RTE in the plan. Here it got
+		 * appended after the RTEs of the INSERT statement, so we need to
+		 * update the varnos to point to the actual position of our RTE.
+		 */
+		foreach_node(TargetEntry, target_entry, custom_scan->custom_scan_tlist) {
+			Var *var = castNode(Var, target_entry->expr);
+			var->varno = list_length(postgres_plan->rtable);
+		}
+
+		return postgres_plan;
 	}
 
-	/* Put a DuckdDB RTE at the end of the rtable */
 	RangeTblEntry *rte = DuckdbRangeTableEntry(custom_scan);
-	postgres_plan->rtable = lappend(postgres_plan->rtable, rte);
 
-	/* Update the varno of the Var nodes in the custom_scan_tlist, to point to
-	 * our new RTE. This should not be necessary anymore when we stop relying
-	 * on the standard_planner here. */
-	foreach_node(TargetEntry, target_entry, custom_scan->custom_scan_tlist) {
-		Var *var = castNode(Var, target_entry->expr);
+	PlannedStmt *result = makeNode(PlannedStmt);
+	result->commandType = parse->commandType;
+	result->queryId = parse->queryId;
+	result->hasReturning = (parse->returningList != NIL);
+	result->hasModifyingCTE = parse->hasModifyingCTE;
+	result->canSetTag = parse->canSetTag;
+	result->transientPlan = false;
+	result->dependsOnRole = false;
+	result->parallelModeNeeded = false;
+	result->planTree = duckdb_plan;
+	result->rtable = list_make1(rte);
+#if PG_VERSION_NUM >= 160000
+	result->permInfos = NULL;
+#endif
+#if PG_VERSION_NUM >= 190000
+	result->resultRelationRelids = NULL;
+#else
+	result->resultRelations = NULL;
+#endif
+	result->appendRelations = NULL;
+	result->subplans = NIL;
+	result->rewindPlanIDs = NULL;
+	result->rowMarks = NIL;
+	result->relationOids = NIL;
+	result->invalItems = NIL;
+	result->paramExecTypes = NIL;
 
-		var->varno = list_length(postgres_plan->rtable);
-	}
+	/* utilityStmt should be null, but we might as well copy it */
+	result->utilityStmt = parse->utilityStmt;
+	result->stmt_location = parse->stmt_location;
+	result->stmt_len = parse->stmt_len;
 
-	return postgres_plan;
+	return result;
 }
