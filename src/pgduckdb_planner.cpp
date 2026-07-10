@@ -35,8 +35,11 @@ extern "C" {
 #include "utils/rel.h"
 
 #include "pgduckdb/pgduckdb_ruleutils.h"
+#include "utils/builtins.h"
 
+#if PG_VERSION_NUM >= 180000
 #include "executor/executor.h"
+#endif
 }
 
 #include "pgduckdb/pg/types.hpp"
@@ -167,57 +170,29 @@ DuckdbPrepare(const Query *query, const char *explain_prefix) {
 	return con->context->Prepare(query_string);
 }
 
-typedef struct FindSubqueryVarContext {
-	int select_rti;
-	AttrNumber attno;
-} FindSubqueryVarContext;
-
-static bool
-FindSubqueryVarWalker(Node *node, void *context) {
-	FindSubqueryVarContext *ctx = (FindSubqueryVarContext *)context;
-	if (node == NULL) {
-		return false;
-	}
-
-	if (IsA(node, Var)) {
-		Var *var = (Var *)node;
-		if (var->varno == ctx->select_rti) {
-			ctx->attno = var->varattno;
-			return true;
-		}
-		return false;
-	}
-
-#if PG_VERSION_NUM >= 160000
-	return expression_tree_walker(node, FindSubqueryVarWalker, context);
-#else
-	return expression_tree_walker(node, (bool (*)())((void *)FindSubqueryVarWalker), context);
-#endif
-}
-
 /*
  * ReconstructTargetListForInsert - Aligns the target list with the table's columns
  *
  * The DuckDB scan produces the output columns of the SELECT source, but the
  * ModifyTable node expects one value per table column, in the order of the
- * table definition. The INSERT might assign the SELECT columns to a subset of
- * the table's columns and in a different order than the table definition, so
- * we cannot simply map them positionally. Instead we use the Var in each
- * entry of the INSERT its targetlist, which references the SELECT column that
- * is assigned to that table column, and that matches the position of the
- * DuckDB scan output. Columns that the INSERT doesn't assign get their
- * default expression that the rewriter put in the targetlist, or NULL when
- * there is none.
+ * table definition and with exactly the types of those columns. The INSERT
+ * might assign the SELECT columns to a subset of the table's columns and in a
+ * different order than the table definition, so we cannot simply map them
+ * positionally. Instead we use the Var in each entry of the INSERT its
+ * targetlist, which references the SELECT column that is assigned to that
+ * table column, and that matches the position of the DuckDB scan output.
+ * Columns that the INSERT doesn't assign get their default expression that
+ * the rewriter put in the targetlist, or NULL when there is none.
  */
 static List *
 ReconstructTargetListForInsert(TupleDesc pg_tupdesc, Query *query, List *duckdb_targetlist) {
 	List *target_list = NIL;
 
-	FindSubqueryVarContext ctx = {0, 0};
+	int select_rti = 0;
 	int rti = 1;
 	foreach_node(RangeTblEntry, rte, query->rtable) {
 		if (rte->rtekind == RTE_SUBQUERY) {
-			ctx.select_rti = rti;
+			select_rti = rti;
 		}
 		rti++;
 	}
@@ -243,26 +218,52 @@ ReconstructTargetListForInsert(TupleDesc pg_tupdesc, Query *query, List *duckdb_
 		 * that the rewriter put there, or an unknown-type constant that the
 		 * parser inlined instead of creating a Var for it. In both of those
 		 * cases the expression itself produces the value to insert, so we
-		 * can use it directly.
+		 * can use it directly. Those expressions were also already coerced to
+		 * the column type, which is not necessarily true for the columns that
+		 * DuckDB returns (e.g. a DuckDB VARCHAR always maps to text, even
+		 * when the column is of type varchar), so for those we add a coercion
+		 * when necessary.
 		 */
 		TargetEntry *target_entry = NULL;
 		foreach_node(TargetEntry, query_target_entry, query->targetList) {
-			if (query_target_entry->resno == attr->attnum) {
-				ctx.attno = 0;
-				FindSubqueryVarWalker((Node *)query_target_entry->expr, &ctx);
-				if (ctx.attno != 0) {
-					if (ctx.attno > list_length(duckdb_targetlist)) {
-						elog(ERROR, "SELECT column assigned to column \"%s\" is missing from the DuckDB result",
-						     NameStr(attr->attname));
-					}
-					target_entry =
-					    (TargetEntry *)copyObjectImpl(list_nth_node(TargetEntry, duckdb_targetlist, ctx.attno - 1));
-					target_entry->resno = attr->attnum;
-				} else {
-					target_entry = query_target_entry;
+			if (query_target_entry->resno != attr->attnum) {
+				continue;
+			}
+
+			AttrNumber select_attno = 0;
+			foreach_node(Var, var, pull_var_clause((Node *)query_target_entry->expr, 0)) {
+				if (var->varno == select_rti) {
+					select_attno = var->varattno;
+					break;
 				}
+			}
+
+			if (select_attno == 0) {
+				target_entry = query_target_entry;
 				break;
 			}
+
+			if (select_attno > list_length(duckdb_targetlist)) {
+				elog(ERROR, "SELECT column assigned to column \"%s\" is missing from the DuckDB result",
+				     NameStr(attr->attname));
+			}
+
+			target_entry = list_nth_node(TargetEntry, duckdb_targetlist, select_attno - 1);
+			target_entry->resno = attr->attnum;
+
+			Oid source_type = exprType((Node *)target_entry->expr);
+			int32 source_typmod = exprTypmod((Node *)target_entry->expr);
+			if (source_type != attr->atttypid || source_typmod != attr->atttypmod) {
+				Expr *coerced_expr =
+				    (Expr *)coerce_to_target_type(NULL, (Node *)target_entry->expr, source_type, attr->atttypid,
+				                                  attr->atttypmod, COERCION_EXPLICIT, COERCE_IMPLICIT_CAST, -1);
+				if (coerced_expr == NULL) {
+					elog(ERROR, "cannot coerce column \"%s\" from type %s to type %s", NameStr(attr->attname),
+					     format_type_be(source_type), format_type_be(attr->atttypid));
+				}
+				target_entry->expr = coerced_expr;
+			}
+			break;
 		}
 
 		if (target_entry) {
@@ -383,60 +384,6 @@ DuckdbRangeTableEntry(CustomScan *custom_scan) {
 	return rte;
 }
 
-/*
- * CoerceTargetList - Coerces the target list from DuckDB to match PostgreSQL types
- *
- * This function takes a target list from a DuckDB query and ensures that each column
- * has the correct data type expected by PostgreSQL. It adds type coercions where
- * necessary to make the types compatible.
- *
- * Parameters:
- *   duckdb_targetlist - The target list from the DuckDB query
- *   pg_tupdesc - PostgreSQL tuple descriptor containing the expected column types
- *
- * Returns:
- *   A new target list with appropriate type coercions applied
- */
-List *
-CoerceTargetList(List *duckdb_targetlist, TupleDesc pg_tupdesc) {
-	List *ret = NIL;
-
-	foreach_node(TargetEntry, source_te, duckdb_targetlist) {
-		AttrNumber attnum = source_te->resno;
-		if (attnum > pg_tupdesc->natts) {
-			elog(ERROR, "DuckDB query returns more columns than Postgres wants");
-		}
-
-		/* Get expected target type */
-		Form_pg_attribute attr = TupleDescAttr(pg_tupdesc, attnum - 1);
-		Oid targetTypeId = attr->atttypid;
-		int32 targetTypeMod = attr->atttypmod;
-
-		/* Get source expression and its type */
-		Expr *expr = source_te->expr;
-		Oid sourceTypeId = exprType((Node *)expr);
-		int32 sourceTypeMod = exprTypmod((Node *)expr);
-
-		/* Add coercion if needed */
-		if (sourceTypeId != targetTypeId || sourceTypeMod != targetTypeMod) {
-			expr = (Expr *)coerce_to_target_type(NULL, (Node *)expr, sourceTypeId, targetTypeId, targetTypeMod,
-			                                     COERCION_EXPLICIT, COERCE_IMPLICIT_CAST, -1);
-
-			if (expr == NULL)
-				elog(ERROR, "cannot coerce column %d from type %u to target type %u", attnum, sourceTypeId,
-				     targetTypeId);
-
-			/* Create a new target entry with coerced expression */
-			TargetEntry *new_te = makeTargetEntry(expr, attnum, source_te->resname, source_te->resjunk);
-			ret = lappend(ret, new_te);
-		} else {
-			ret = lappend(ret, source_te);
-		}
-	}
-
-	return ret;
-}
-
 static void
 check_view_perms_recursive(Query *query) {
 	ListCell *lc;
@@ -515,8 +462,6 @@ DuckdbPlanNode(Query *parse, int cursor_options, bool throw_error) {
 		Query *copied_query = (Query *)copyObjectImpl(parse);
 		PlannedStmt *postgres_plan = standard_planner(copied_query, NULL, cursor_options, NULL);
 		Assert(IsA(postgres_plan->planTree, ModifyTable));
-		TupleDesc target_desc = ExecTypeFromTL(outerPlan(postgres_plan->planTree)->targetlist);
-		duckdb_plan->targetlist = CoerceTargetList(duckdb_plan->targetlist, target_desc);
 		outerPlan(postgres_plan->planTree) = duckdb_plan;
 
 		/* Put a DuckDB RTE at the end of the rtable */
