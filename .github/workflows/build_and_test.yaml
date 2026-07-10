@@ -54,7 +54,7 @@ jobs:
           type: ReleaseStatic
         - version: REL_18_STABLE
           type: Debug
-        - version: master
+        - version: REL_19_STABLE
           type: Release
 
     runs-on: ubuntu-24.04
