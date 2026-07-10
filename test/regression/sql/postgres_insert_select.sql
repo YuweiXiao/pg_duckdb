@@ -31,6 +31,21 @@ INSERT INTO tbl (a, b) SELECT i, 'foo' FROM generate_series(4, 6) i;
 SELECT * FROM tbl;
 DROP TABLE tbl;
 
+-- case: INSERT INTO TABLE (col2, col1), i.e. columns in a different order
+-- than the table definition
+CREATE TABLE tbl (a int, b text, c int);
+INSERT INTO tbl (b, a) SELECT r['x']::text, r['y']::int FROM duckdb.query($$ SELECT 'hello' x, 42 y $$) r;
+INSERT INTO tbl (c, a, b) SELECT r['x']::int, r['y']::int, r['z']::text FROM duckdb.query($$ SELECT 1 x, 2 y, 'abc' z $$) r;
+SELECT * FROM tbl ORDER BY a;
+DROP TABLE tbl;
+
+-- case: table with a dropped column
+CREATE TABLE tbl (a int, b text, c int);
+ALTER TABLE tbl DROP COLUMN b;
+INSERT INTO tbl (c, a) SELECT r['x']::int, r['y']::int FROM duckdb.query($$ SELECT 1 x, 2 y $$) r;
+SELECT * FROM tbl;
+DROP TABLE tbl;
+
 -- case: RETURNING
 CREATE TABLE tbl (a int PRIMARY KEY, b text);
 INSERT INTO tbl (a, b) SELECT i, 'foo' FROM generate_series(1, 3) i RETURNING a, b;

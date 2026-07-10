@@ -160,37 +160,97 @@ DuckdbPrepare(const Query *query, const char *explain_prefix) {
 	return con->context->Prepare(query_string);
 }
 
+typedef struct FindSubqueryVarContext {
+	int select_rti;
+	AttrNumber attno;
+} FindSubqueryVarContext;
+
+static bool
+FindSubqueryVarWalker(Node *node, void *context) {
+	FindSubqueryVarContext *ctx = (FindSubqueryVarContext *)context;
+	if (node == NULL) {
+		return false;
+	}
+
+	if (IsA(node, Var)) {
+		Var *var = (Var *)node;
+		if (var->varno == ctx->select_rti) {
+			ctx->attno = var->varattno;
+			return true;
+		}
+		return false;
+	}
+
+#if PG_VERSION_NUM >= 160000
+	return expression_tree_walker(node, FindSubqueryVarWalker, context);
+#else
+	return expression_tree_walker(node, (bool (*)())((void *)FindSubqueryVarWalker), context);
+#endif
+}
+
 /*
  * ReconstructTargetListForInsert - Aligns the target list with the table's columns
  *
- * When inserting data with a different column count or order than the target table,
- * this function reconstructs the target list to ensure proper alignment between
- * source and destination columns. It handles default values for unmatched columns.
+ * The DuckDB scan produces the output columns of the SELECT source, but the
+ * ModifyTable node expects one value per table column, in the order of the
+ * table definition. The INSERT might assign the SELECT columns to a subset of
+ * the table's columns and in a different order than the table definition, so
+ * we cannot simply map them positionally. Instead we use the Var in each
+ * entry of the INSERT its targetlist, which references the SELECT column that
+ * is assigned to that table column, and that matches the position of the
+ * DuckDB scan output. Columns that the INSERT doesn't assign get their
+ * default expression that the rewriter put in the targetlist, or NULL when
+ * there is none.
  */
 static List *
-ReconstructTargetListForInsert(TupleDesc pg_tupdesc, List *query_targetlist, List *duckdb_targetlist) {
+ReconstructTargetListForInsert(TupleDesc pg_tupdesc, Query *query, List *duckdb_targetlist) {
 	List *target_list = NIL;
-	ListCell *duckdb_targetlist_cell = list_head(duckdb_targetlist);
+
+	FindSubqueryVarContext ctx = {0, 0};
+	int rti = 1;
+	foreach_node(RangeTblEntry, rte, query->rtable) {
+		if (rte->rtekind == RTE_SUBQUERY) {
+			ctx.select_rti = rti;
+		}
+		rti++;
+	}
 
 	for (int i = 0; i < pg_tupdesc->natts; i++) {
 		Form_pg_attribute attr = TupleDescAttr(pg_tupdesc, i);
 
-		/* Skip dropped columns */
-		if (attr->attisdropped)
+		/*
+		 * For dropped columns the ModifyTable node expects a NULL constant,
+		 * see ExecCheckPlanOutput.
+		 */
+		if (attr->attisdropped) {
+			TargetEntry *null_entry =
+			    makeTargetEntry((Expr *)makeNullConst(INT4OID, -1, InvalidOid), attr->attnum, NULL, false);
+			target_list = lappend(target_list, null_entry);
 			continue;
+		}
 
 		/*
-		 * Locate the matching column in the query target list.
-		 * Use the existing TargetEntry if found, or create a NULL entry if not.
+		 * Locate the matching column in the query target list. If its
+		 * expression references a SELECT column we use the matching column
+		 * of the DuckDB scan. If it doesn't, it's either a default value
+		 * that the rewriter put there, or an unknown-type constant that the
+		 * parser inlined instead of creating a Var for it. In both of those
+		 * cases the expression itself produces the value to insert, so we
+		 * can use it directly.
 		 */
 		TargetEntry *target_entry = NULL;
-		for (int j = 0; j < list_length(query_targetlist); j++) {
-			TargetEntry *query_target_entry = (TargetEntry *)list_nth(query_targetlist, j);
+		foreach_node(TargetEntry, query_target_entry, query->targetList) {
 			if (query_target_entry->resno == attr->attnum) {
-				if (pgduckdb_is_not_default_expr((Node *)query_target_entry, NULL)) {
-					target_entry = (TargetEntry *)lfirst(duckdb_targetlist_cell);
+				ctx.attno = 0;
+				FindSubqueryVarWalker((Node *)query_target_entry->expr, &ctx);
+				if (ctx.attno != 0) {
+					if (ctx.attno > list_length(duckdb_targetlist)) {
+						elog(ERROR, "SELECT column assigned to column \"%s\" is missing from the DuckDB result",
+						     NameStr(attr->attname));
+					}
+					target_entry =
+					    (TargetEntry *)copyObjectImpl(list_nth_node(TargetEntry, duckdb_targetlist, ctx.attno - 1));
 					target_entry->resno = attr->attnum;
-					duckdb_targetlist_cell = lnext(duckdb_targetlist, duckdb_targetlist_cell);
 				} else {
 					target_entry = query_target_entry;
 				}
@@ -280,14 +340,12 @@ CreatePlan(Query *query, bool throw_error) {
 		TupleDesc pg_tupdesc = RelationGetDescr(rel);
 
 		/*
-		 * When the target table's column count differs from the prepared result's column count (e.g., in an INSERT with
-		 * explicit column names), we must reconstruct the target list to ensure proper column alignment between the
-		 * source and destination.
+		 * This also needs to happen when the column counts match, because an
+		 * INSERT that specifies all columns can still assign them in a
+		 * different order than the table definition.
 		 */
-		if (pg_tupdesc->natts != prepared_result_types.size()) {
-			duckdb_node->scan.plan.targetlist =
-			    ReconstructTargetListForInsert(pg_tupdesc, query->targetList, duckdb_node->scan.plan.targetlist);
-		}
+		duckdb_node->scan.plan.targetlist =
+		    ReconstructTargetListForInsert(pg_tupdesc, query, duckdb_node->scan.plan.targetlist);
 
 		RelationClose(rel);
 	}
