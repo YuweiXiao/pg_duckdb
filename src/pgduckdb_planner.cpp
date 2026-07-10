@@ -460,7 +460,11 @@ DuckdbPlanNode(Query *parse, int cursor_options, bool throw_error) {
 	 */
 	if (IsAllowedPostgresInsert(parse, true)) {
 		Query *copied_query = (Query *)copyObjectImpl(parse);
+#if PG_VERSION_NUM >= 190000
+		PlannedStmt *postgres_plan = standard_planner(copied_query, NULL, cursor_options, NULL, NULL);
+#else
 		PlannedStmt *postgres_plan = standard_planner(copied_query, NULL, cursor_options, NULL);
+#endif
 		Assert(IsA(postgres_plan->planTree, ModifyTable));
 		outerPlan(postgres_plan->planTree) = duckdb_plan;
 
