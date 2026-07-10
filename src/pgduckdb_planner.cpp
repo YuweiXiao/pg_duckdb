@@ -44,7 +44,6 @@ extern "C" {
 #include "pgduckdb/pgduckdb_node.hpp"
 #include "pgduckdb/vendor/pg_list.hpp"
 #include "pgduckdb/utility/cpp_wrapper.hpp"
-#include "pgduckdb/pgduckdb_guc.hpp"
 #include "pgduckdb/pgduckdb_types.hpp"
 
 static bool
@@ -69,8 +68,7 @@ IsAllowedPostgresInsert(Query *query, bool throw_error) {
 
 	int elevel = throw_error ? ERROR : DEBUG4;
 	if (query->commandType != CMD_INSERT) {
-		elog(pgduckdb::duckdb_log_pg_explain ? NOTICE : elevel,
-		     "DuckDB only supports INSERT/SELECT on Postgres tables");
+		elog(elevel, "DuckDB only supports INSERT/SELECT on Postgres tables");
 		return false;
 	}
 
@@ -89,7 +87,7 @@ IsAllowedPostgresInsert(Query *query, bool throw_error) {
 	}
 
 	if (!select_rte) {
-		elog(pgduckdb::duckdb_log_pg_explain ? NOTICE : elevel, "DuckDB does not support INSERT without a subquery");
+		elog(elevel, "DuckDB does not support INSERT without a subquery");
 		return false;
 	}
 
@@ -98,8 +96,7 @@ IsAllowedPostgresInsert(Query *query, bool throw_error) {
 	 * DuckDB, such as differences in bytea representation and numeric rounding.
 	 */
 	if (ContainValueRTE(select_rte->subquery)) {
-		elog(pgduckdb::duckdb_log_pg_explain ? NOTICE : elevel,
-		     "DuckDB does not support INSERTs with value subqueries");
+		elog(elevel, "DuckDB does not support INSERTs with value subqueries");
 		return false;
 	}
 
@@ -118,8 +115,7 @@ IsAllowedPostgresInsert(Query *query, bool throw_error) {
 		 */
 		auto duckdb_col_type = pgduckdb::ConvertPostgresToDuckColumnType(attr);
 		if (duckdb_col_type.id() == duckdb::LogicalTypeId::INVALID) {
-			elog(pgduckdb::duckdb_log_pg_explain ? NOTICE : elevel,
-			     "DuckDB does not support INSERTs into tables with column `%s` of unsupported type (OID %u). ",
+			elog(elevel, "DuckDB does not support INSERTs into tables with column `%s` of unsupported type (OID %u). ",
 			     NameStr(attr->attname), attr->atttypid);
 			ret = false;
 			break;

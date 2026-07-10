@@ -18,7 +18,6 @@ Parallel Seq Scan on query_filter_int
 DROP TABLE query_filter_int;
 CREATE TABLE query_filter_float(a FLOAT8);
 INSERT INTO query_filter_float VALUES (0.9), (1.0), (1.1);
-NOTICE:  DuckDB does not support INSERT without a subquery
 SELECT COUNT(*) FROM query_filter_float WHERE a < 1.0;
 NOTICE:  (PGDuckDB/PostgresTableReader)
 
@@ -64,7 +63,6 @@ Parallel Seq Scan on query_filter_float
 DROP TABLE query_filter_float;
 CREATE TABLE query_filter_varchar(a VARCHAR, b VARCHAR);
 INSERT INTO query_filter_varchar VALUES ('t1', 't%'), ('t2', '%%'), ('t1', '');
-NOTICE:  DuckDB does not support INSERT without a subquery
 SELECT COUNT(*)FROM query_filter_varchar WHERE a = 't1';
 NOTICE:  (PGDuckDB/PostgresTableReader)
 
@@ -108,7 +106,6 @@ Parallel Seq Scan on query_filter_varchar
 (1 row)
 
 INSERT INTO query_filter_varchar VALUES ('at1'), ('btt'), ('%t%t%t%'), ('_t_t_t_');
-NOTICE:  DuckDB does not support INSERT without a subquery
 -- Pushed down to PG executor
 SELECT a FROM query_filter_varchar WHERE a LIKE '%t%';
 NOTICE:  (PGDuckDB/PostgresTableReader)
@@ -985,7 +982,6 @@ Parallel Seq Scan on query_filter_varchar
 DROP TABLE query_filter_varchar;
 CREATE TABLE query_filter_output_column(a INT, b VARCHAR, c FLOAT8);
 INSERT INTO query_filter_output_column VALUES (1, 't1', 1.0), (2, 't1', 2.0), (2, 't2', 1.0);
-NOTICE:  DuckDB does not support INSERT without a subquery
 -- Projection ids list will be used (column `a`is not needed after scan)
 SELECT b FROM query_filter_output_column WHERE a = 2;
 NOTICE:  (PGDuckDB/PostgresTableReader)
