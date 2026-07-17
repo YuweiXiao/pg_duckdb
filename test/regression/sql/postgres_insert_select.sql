@@ -69,15 +69,35 @@ SELECT * FROM tbl ORDER BY a;
 DEALLOCATE heap_insert;
 DROP TABLE tbl;
 
--- case: CTEs attached to the INSERT itself are not supported, because the
--- WITH clause would be lost when only the SELECT runs in DuckDB
+-- case: CTEs attached to the INSERT are moved into the SELECT that DuckDB
+-- executes
 CREATE TABLE tbl (a int, b text);
-WITH x AS (SELECT r['a']::int a, r['b']::text b FROM duckdb.query($$ SELECT 1 a, 'foo' b $$) r)
+WITH x AS (SELECT r['a']::int a, r['b']::text b FROM duckdb.query($$ SELECT 1 a, 'basic' b $$) r)
 INSERT INTO tbl SELECT * FROM x;
--- But CTEs inside the SELECT itself work fine
-INSERT INTO tbl SELECT * FROM (WITH x AS (SELECT r['a']::int a, r['b']::text b FROM duckdb.query($$ SELECT 1 a, 'foo' b $$) r) SELECT * FROM x) sub;
-SELECT * FROM tbl;
-DROP TABLE tbl;
+-- Also when they reference each other, are recursive, or when the SELECT has
+-- CTEs of its own
+WITH x AS (SELECT r['a']::int a FROM duckdb.query($$ SELECT 2 a $$) r),
+     y AS (SELECT a, 'chained' FROM x)
+INSERT INTO tbl SELECT * FROM y;
+WITH RECURSIVE fib(a, b) AS (
+    SELECT 3, 'rec' UNION ALL SELECT a + 1, b FROM fib WHERE a < 5
+)
+INSERT INTO tbl SELECT a, b FROM fib, duckdb.query($$ SELECT 1 $$) r;
+WITH x AS (SELECT r['a']::int a FROM duckdb.query($$ SELECT 6 a $$) r)
+INSERT INTO tbl WITH y AS (SELECT a, 'both' FROM x) SELECT * FROM y;
+-- CTEs inside the SELECT itself also work on their own
+INSERT INTO tbl SELECT * FROM (WITH x AS (SELECT r['a']::int a, r['b']::text b FROM duckdb.query($$ SELECT 7 a, 'sub' b $$) r) SELECT * FROM x) sub;
+-- A CTE that shadows a real table reads from the CTE, not the table
+CREATE TABLE x (a int, b text);
+INSERT INTO x VALUES (99, 'WRONG');
+WITH x AS (SELECT r['a']::int a, 'shadow'::text b FROM duckdb.query($$ SELECT 8 a $$) r)
+INSERT INTO tbl SELECT * FROM x;
+-- If the same CTE name is used on both the INSERT and the SELECT, DuckDB
+-- errors on the duplicate name instead of silently picking one
+WITH x AS (SELECT r['a']::int a, 'outer'::text b FROM duckdb.query($$ SELECT 9 a $$) r)
+INSERT INTO tbl WITH x AS (SELECT 9, 'inner') SELECT * FROM x;
+SELECT * FROM tbl ORDER BY a;
+DROP TABLE tbl, x;
 
 -- case: EXPLAIN ANALYZE is not supported, because it would silently insert
 -- nothing while a Postgres-executed EXPLAIN ANALYZE actually inserts the rows

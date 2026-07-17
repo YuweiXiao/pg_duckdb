@@ -24,6 +24,7 @@ extern "C" {
 #include "optimizer/planmain.h"
 #include "parser/parse_coerce.h"
 #include "rewrite/rewriteHandler.h"
+#include "rewrite/rewriteManip.h"
 #include "tcop/pquery.h"
 #include "utils/typcache.h"
 #include "utils/rel.h"
@@ -98,19 +99,6 @@ IsAllowedPostgresInsert(Query *query, bool throw_error) {
 	int elevel = throw_error ? ERROR : DEBUG4;
 	if (query->commandType != CMD_INSERT) {
 		elog(elevel, "DuckDB only supports INSERT/SELECT on Postgres tables");
-		return false;
-	}
-
-	/*
-	 * Only the SELECT source of the INSERT is deparsed and sent to DuckDB, so
-	 * any CTEs attached to the INSERT statement itself would be lost in that
-	 * deparse. The SELECT would then reference tables that don't exist, or
-	 * even worse, silently read from an unrelated DuckDB table that happens
-	 * to have the same name as the CTE. CTEs inside the SELECT itself are
-	 * fine, those are included in the deparsed query.
-	 */
-	if (query->cteList != NIL) {
-		elog(elevel, "DuckDB does not support INSERTs with a CTE");
 		return false;
 	}
 
@@ -192,7 +180,32 @@ DuckdbPrepare(const Query *query, const char *explain_prefix) {
 		 * pre-planning phase */
 		Assert(select_rti != 0);
 		RangeTblEntry *select_rte = list_nth_node(RangeTblEntry, copied_query->rtable, select_rti - 1);
-		query_string = pgduckdb_get_querydef(select_rte->subquery);
+		Query *select_query = select_rte->subquery;
+
+		/*
+		 * CTEs attached to the INSERT statement itself would be lost when
+		 * only the SELECT is deparsed, so we move them into the SELECT query.
+		 * Because they move down a query level, all references to them from
+		 * within the SELECT need their levelsup decremented, similar to what
+		 * pull_up_simple_subquery does. That has to happen before attaching
+		 * the moved CTEs, so that references between those CTEs themselves
+		 * are not changed. The SELECT can also have CTEs of its own, in which
+		 * case both lists are simply combined into one WITH clause. That
+		 * needs no further fixups, because CTE references are resolved by
+		 * name (the ctename of the RTE_CTE entries) and not by position in
+		 * the cteList, and the moved CTEs are put first so they stay visible
+		 * to the CTEs of the SELECT that reference them. If a name is used in
+		 * both lists Postgres its shadowing semantics are lost, but luckily
+		 * DuckDB errors on duplicate CTE names instead of silently picking
+		 * one.
+		 */
+		if (copied_query->cteList != NIL) {
+			IncrementVarSublevelsUp((Node *)select_query, -1, 1);
+			select_query->cteList = list_concat(copied_query->cteList, select_query->cteList);
+			select_query->hasRecursive = select_query->hasRecursive || copied_query->hasRecursive;
+		}
+
+		query_string = pgduckdb_get_querydef(select_query);
 	} else {
 		query_string = pgduckdb_get_querydef(copied_query);
 	}
