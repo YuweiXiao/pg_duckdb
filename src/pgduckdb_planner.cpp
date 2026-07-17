@@ -63,6 +63,26 @@ ContainValueRTE(Query *query) {
 	return false;
 }
 
+/*
+ * Returns the range table index of the SELECT subquery of an INSERT, or 0 if
+ * there is none. The parser wraps the source of an INSERT ... SELECT in a
+ * single top-level subquery RTE, so there can be at most one, which the
+ * Assert double-checks.
+ */
+static int
+FindInsertSelectRTI(const Query *query) {
+	int select_rti = 0;
+	int rti = 1;
+	foreach_node(RangeTblEntry, rte, query->rtable) {
+		if (rte->rtekind == RTE_SUBQUERY) {
+			Assert(select_rti == 0);
+			select_rti = rti;
+		}
+		rti++;
+	}
+	return select_rti;
+}
+
 bool
 IsAllowedPostgresInsert(Query *query, bool throw_error) {
 	if (query->commandType == CMD_SELECT || query->resultRelation == 0) {
@@ -82,17 +102,12 @@ IsAllowedPostgresInsert(Query *query, bool throw_error) {
 	}
 
 	/* Checking supported INSERT types */
-	RangeTblEntry *select_rte = NULL;
-	foreach_node(RangeTblEntry, rte, query->rtable) {
-		if (rte->rtekind == RTE_SUBQUERY) {
-			select_rte = rte;
-		}
-	}
-
-	if (!select_rte) {
+	int select_rti = FindInsertSelectRTI(query);
+	if (select_rti == 0) {
 		elog(elevel, "DuckDB does not support INSERT without a subquery");
 		return false;
 	}
+	RangeTblEntry *select_rte = list_nth_node(RangeTblEntry, query->rtable, select_rti - 1);
 
 	/*
 	 * If the subquery references value RTEs we prefer executing the statement
@@ -144,16 +159,12 @@ DuckdbPrepare(const Query *query, const char *explain_prefix) {
 	 * required.
 	 */
 	if (IsAllowedPostgresInsert(copied_query, true)) {
-		RangeTblEntry *select_rte = NULL;
-		foreach_node(RangeTblEntry, rte, copied_query->rtable) {
-			if (rte->rtekind == RTE_SUBQUERY) {
-				select_rte = rte;
-			}
-		}
+		int select_rti = FindInsertSelectRTI(copied_query);
 
 		/* A subquery must be present at this point; other cases should have been filtered out during the
 		 * pre-planning phase */
-		Assert(select_rte);
+		Assert(select_rti != 0);
+		RangeTblEntry *select_rte = list_nth_node(RangeTblEntry, copied_query->rtable, select_rti - 1);
 		query_string = pgduckdb_get_querydef(select_rte->subquery);
 	} else {
 		query_string = pgduckdb_get_querydef(copied_query);
@@ -187,15 +198,13 @@ static List *
 ReconstructTargetListForInsert(TupleDesc pg_tupdesc, Query *query, List *duckdb_targetlist) {
 	List *target_list = NIL;
 
-	int select_rti = 0;
-	int rti = 1;
-	foreach_node(RangeTblEntry, rte, query->rtable) {
-		if (rte->rtekind == RTE_SUBQUERY) {
-			select_rti = rti;
-		}
-		rti++;
-	}
+	/*
+	 * Find the range table index of the SELECT subquery, so we can recognize
+	 * which Vars in the INSERT targetlist reference its output columns.
+	 */
+	int select_rti = FindInsertSelectRTI(query);
 
+	/* Build one targetlist entry per table column, in table definition order. */
 	for (int i = 0; i < pg_tupdesc->natts; i++) {
 		Form_pg_attribute attr = TupleDescAttr(pg_tupdesc, i);
 
@@ -211,17 +220,8 @@ ReconstructTargetListForInsert(TupleDesc pg_tupdesc, Query *query, List *duckdb_
 		}
 
 		/*
-		 * Locate the matching column in the query target list. If its
-		 * expression references a SELECT column we use the matching column
-		 * of the DuckDB scan. If it doesn't, it's either a default value
-		 * that the rewriter put there, or an unknown-type constant that the
-		 * parser inlined instead of creating a Var for it. In both of those
-		 * cases the expression itself produces the value to insert, so we
-		 * can use it directly. Those expressions were also already coerced to
-		 * the column type, which is not necessarily true for the columns that
-		 * DuckDB returns (e.g. a DuckDB VARCHAR always maps to text, even
-		 * when the column is of type varchar), so for those we add a coercion
-		 * when necessary.
+		 * Locate the entry in the INSERT its targetlist that assigns a value
+		 * to this table column.
 		 */
 		TargetEntry *target_entry = NULL;
 		foreach_node(TargetEntry, query_target_entry, query->targetList) {
@@ -229,6 +229,11 @@ ReconstructTargetListForInsert(TupleDesc pg_tupdesc, Query *query, List *duckdb_
 				continue;
 			}
 
+			/*
+			 * Check whether this expression references a SELECT column, and
+			 * if so which one. That position matches the position in the
+			 * DuckDB scan output.
+			 */
 			AttrNumber select_attno = 0;
 			foreach_node(Var, var, pull_var_clause((Node *)query_target_entry->expr, 0)) {
 				if (var->varno == select_rti) {
@@ -237,6 +242,14 @@ ReconstructTargetListForInsert(TupleDesc pg_tupdesc, Query *query, List *duckdb_
 				}
 			}
 
+			/*
+			 * No SELECT column is referenced. Then the expression is either a
+			 * default value that the rewriter put there, or an unknown-type
+			 * constant that the parser inlined instead of creating a Var for
+			 * it. In both cases the expression itself produces the value to
+			 * insert and was already coerced to the column type, so we can
+			 * use it directly.
+			 */
 			if (select_attno == 0) {
 				target_entry = query_target_entry;
 				break;
@@ -247,9 +260,16 @@ ReconstructTargetListForInsert(TupleDesc pg_tupdesc, Query *query, List *duckdb_
 				     NameStr(attr->attname));
 			}
 
+			/* Use the DuckDB scan column that the SELECT column maps to. */
 			target_entry = list_nth_node(TargetEntry, duckdb_targetlist, select_attno - 1);
 			target_entry->resno = attr->attnum;
 
+			/*
+			 * The types of the columns that DuckDB returns don't necessarily
+			 * match the table column types exactly (e.g. a DuckDB VARCHAR
+			 * always maps to text, even when the column is of type varchar),
+			 * so add a cast when they differ.
+			 */
 			Oid source_type = exprType((Node *)target_entry->expr);
 			int32 source_typmod = exprTypmod((Node *)target_entry->expr);
 			if (source_type != attr->atttypid || source_typmod != attr->atttypmod) {
@@ -270,7 +290,11 @@ ReconstructTargetListForInsert(TupleDesc pg_tupdesc, Query *query, List *duckdb_
 			continue;
 		}
 
-		/* For column not found in the target list, create a NULL Expr for it */
+		/*
+		 * The rewriter already added targetlist entries with the default
+		 * expression for all unassigned columns that have a default, so any
+		 * column still missing from the targetlist gets a NULL.
+		 */
 		target_entry = makeTargetEntry((Expr *)makeNullConst(attr->atttypid, attr->atttypmod, attr->attcollation),
 		                               attr->attnum, pstrdup(NameStr(attr->attname)), false);
 		target_list = lappend(target_list, target_entry);
