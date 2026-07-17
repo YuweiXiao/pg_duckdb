@@ -318,14 +318,12 @@ CreatePlan(Query *query, bool throw_error) {
 		typtup->typtypmod = pgduckdb::GetPostgresDuckDBTypemod(prepared_result_types[i]);
 
 		/*
-		 * We hardcode varno 1 here, because usually our final plan will only
-		 * have a single RTE (this custom scan). The exception is an INSERT
-		 * into a Postgres table, where the plan built by standard_planner is
-		 * reused and this custom scan its RTE gets appended to its rtable. In
-		 * that case DuckdbPlanNode updates these varnos to the actual
-		 * position of the RTE.
+		 * We use the invalid varno 0 here, because at this point we don't
+		 * know yet at which position in the rtable of the final plan the RTE
+		 * of this custom scan will end up. DuckdbPlanNode fills in the actual
+		 * position with SetCustomScanVarno once it has built that rtable.
 		 */
-		Var *var = makeVar(1, i + 1, postgresColumnOid, typtup->typtypmod, typtup->typcollation, 0);
+		Var *var = makeVar(0, i + 1, postgresColumnOid, typtup->typtypmod, typtup->typcollation, 0);
 
 		TargetEntry *target_entry =
 		    makeTargetEntry((Expr *)var, i + 1, (char *)pstrdup(prepared_query->GetNames()[i].c_str()), false);
@@ -364,6 +362,19 @@ CreatePlan(Query *query, bool throw_error) {
 	duckdb_node->methods = &duckdb_scan_scan_methods;
 
 	return (Plan *)duckdb_node;
+}
+
+/*
+ * Updates the Vars in the custom_scan_tlist to point to the RTE of the
+ * CustomScan, which CreatePlan left invalid because the position of that RTE
+ * in the rtable is only known once the final plan is built.
+ */
+static void
+SetCustomScanVarno(CustomScan *custom_scan, int varno) {
+	foreach_node(TargetEntry, target_entry, custom_scan->custom_scan_tlist) {
+		Var *var = castNode(Var, target_entry->expr);
+		var->varno = varno;
+	}
 }
 
 /* Creates a matching RangeTblEntry for the given CustomScan node */
@@ -473,17 +484,7 @@ DuckdbPlanNode(Query *parse, int cursor_options, bool throw_error) {
 		/* Put a DuckDB RTE at the end of the rtable */
 		RangeTblEntry *insert_rte = DuckdbRangeTableEntry(custom_scan);
 		postgres_plan->rtable = lappend(postgres_plan->rtable, insert_rte);
-
-		/*
-		 * CreatePlan hardcodes varno 1 in the custom_scan_tlist, because
-		 * normally our CustomScan is the only RTE in the plan. Here it got
-		 * appended after the RTEs of the INSERT statement, so we need to
-		 * update the varnos to point to the actual position of our RTE.
-		 */
-		foreach_node(TargetEntry, target_entry, custom_scan->custom_scan_tlist) {
-			Var *var = castNode(Var, target_entry->expr);
-			var->varno = list_length(postgres_plan->rtable);
-		}
+		SetCustomScanVarno(custom_scan, list_length(postgres_plan->rtable));
 
 		return postgres_plan;
 	}
@@ -501,6 +502,7 @@ DuckdbPlanNode(Query *parse, int cursor_options, bool throw_error) {
 	result->parallelModeNeeded = false;
 	result->planTree = duckdb_plan;
 	result->rtable = list_make1(rte);
+	SetCustomScanVarno(custom_scan, 1);
 #if PG_VERSION_NUM >= 160000
 	result->permInfos = NULL;
 #endif
