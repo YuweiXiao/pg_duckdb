@@ -318,10 +318,12 @@ CreatePlan(Query *query, bool throw_error) {
 		typtup->typtypmod = pgduckdb::GetPostgresDuckDBTypemod(prepared_result_types[i]);
 
 		/*
-		 * We hardcode varno 1 here, because our final plan will only have a
-		 * single RTE (this custom scan). In the past we put 0 here, and then
-		 * filled it in later. If at some point we need multiple RTEs again, we
-		 * might want to start doing that again.
+		 * We hardcode varno 1 here, because usually our final plan will only
+		 * have a single RTE (this custom scan). The exception is an INSERT
+		 * into a Postgres table, where the plan built by standard_planner is
+		 * reused and this custom scan its RTE gets appended to its rtable. In
+		 * that case DuckdbPlanNode updates these varnos to the actual
+		 * position of the RTE.
 		 */
 		Var *var = makeVar(1, i + 1, postgresColumnOid, typtup->typtypmod, typtup->typcollation, 0);
 
