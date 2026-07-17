@@ -122,11 +122,6 @@ IsAllowedPostgresInsert(Query *query, bool throw_error) {
 		 */
 		auto duckdb_col_type = pgduckdb::ConvertPostgresToDuckColumnType(attr);
 		if (duckdb_col_type.id() == duckdb::LogicalTypeId::INVALID) {
-			/*
-			 * When this elog throws an error we never close the relation, but
-			 * that's fine because the transaction abort will release the
-			 * reference on the relation for us.
-			 */
 			elog(elevel, "DuckDB does not support INSERTs into tables with column `%s` of unsupported type (OID %u). ",
 			     NameStr(attr->attname), attr->atttypid);
 			RelationClose(rel);
