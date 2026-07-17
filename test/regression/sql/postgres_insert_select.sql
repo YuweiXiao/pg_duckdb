@@ -53,6 +53,23 @@ INSERT INTO tbl SELECT r['s']::text FROM duckdb.query($$ SELECT 'abcdef' s $$) r
 SELECT * FROM tbl;
 DROP TABLE tbl;
 
+-- case: CTEs attached to the INSERT itself are not supported, because the
+-- WITH clause would be lost when only the SELECT runs in DuckDB
+CREATE TABLE tbl (a int, b text);
+WITH x AS (SELECT r['a']::int a, r['b']::text b FROM duckdb.query($$ SELECT 1 a, 'foo' b $$) r)
+INSERT INTO tbl SELECT * FROM x;
+-- But CTEs inside the SELECT itself work fine
+INSERT INTO tbl SELECT * FROM (WITH x AS (SELECT r['a']::int a, r['b']::text b FROM duckdb.query($$ SELECT 1 a, 'foo' b $$) r) SELECT * FROM x) sub;
+SELECT * FROM tbl;
+DROP TABLE tbl;
+
+-- case: EXPLAIN ANALYZE is not supported, because it would silently insert
+-- nothing while a Postgres-executed EXPLAIN ANALYZE actually inserts the rows
+CREATE TABLE tbl (a int);
+EXPLAIN (ANALYZE, COSTS OFF) INSERT INTO tbl SELECT r['a']::int FROM duckdb.query($$ SELECT 1 a $$) r;
+SELECT * FROM tbl;
+DROP TABLE tbl;
+
 -- case: RETURNING
 CREATE TABLE tbl (a int PRIMARY KEY, b text);
 INSERT INTO tbl (a, b) SELECT i, 'foo' FROM generate_series(1, 3) i RETURNING a, b;

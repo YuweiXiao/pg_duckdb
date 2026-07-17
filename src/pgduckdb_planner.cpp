@@ -101,6 +101,33 @@ IsAllowedPostgresInsert(Query *query, bool throw_error) {
 		return false;
 	}
 
+	/*
+	 * Only the SELECT source of the INSERT is deparsed and sent to DuckDB, so
+	 * any CTEs attached to the INSERT statement itself would be lost in that
+	 * deparse. The SELECT would then reference tables that don't exist, or
+	 * even worse, silently read from an unrelated DuckDB table that happens
+	 * to have the same name as the CTE. CTEs inside the SELECT itself are
+	 * fine, those are included in the deparsed query.
+	 */
+	if (query->cteList != NIL) {
+		elog(elevel, "DuckDB does not support INSERTs with a CTE");
+		return false;
+	}
+
+	/*
+	 * EXPLAIN ANALYZE of an INSERT is supposed to actually insert the rows,
+	 * but in our plan the DuckDB scan would run the SELECT inside a
+	 * DuckDB-side EXPLAIN ANALYZE and return no rows to the ModifyTable node.
+	 * Instead of silently inserting nothing we don't allow DuckDB execution
+	 * for these statements. The duckdb_explain_analyze global is only valid
+	 * while we're actually planning an EXPLAIN query, which is why we also
+	 * check the commandTag of the ActivePortal.
+	 */
+	if (duckdb_explain_analyze && ActivePortal && ActivePortal->commandTag == CMDTAG_EXPLAIN) {
+		elog(elevel, "DuckDB does not support EXPLAIN ANALYZE on INSERTs into Postgres tables");
+		return false;
+	}
+
 	/* Checking supported INSERT types */
 	int select_rti = FindInsertSelectRTI(query);
 	if (select_rti == 0) {
