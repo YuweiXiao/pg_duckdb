@@ -46,6 +46,13 @@ INSERT INTO tbl (c, a) SELECT r['x']::int, r['y']::int FROM duckdb.query($$ SELE
 SELECT * FROM tbl;
 DROP TABLE tbl;
 
+-- case: values that don't fit the column type throw an error, just like
+-- they would with Postgres execution
+CREATE TABLE tbl (v varchar(3));
+INSERT INTO tbl SELECT r['s']::text FROM duckdb.query($$ SELECT 'abcdef' s $$) r;
+SELECT * FROM tbl;
+DROP TABLE tbl;
+
 -- case: RETURNING
 CREATE TABLE tbl (a int PRIMARY KEY, b text);
 INSERT INTO tbl (a, b) SELECT i, 'foo' FROM generate_series(1, 3) i RETURNING a, b;

@@ -92,6 +92,17 @@ SELECT * FROM tbl;
 (1 row)
 
 DROP TABLE tbl;
+-- case: values that don't fit the column type throw an error, just like
+-- they would with Postgres execution
+CREATE TABLE tbl (v varchar(3));
+INSERT INTO tbl SELECT r['s']::text FROM duckdb.query($$ SELECT 'abcdef' s $$) r;
+ERROR:  value too long for type character varying(3)
+SELECT * FROM tbl;
+ v 
+---
+(0 rows)
+
+DROP TABLE tbl;
 -- case: RETURNING
 CREATE TABLE tbl (a int PRIMARY KEY, b text);
 INSERT INTO tbl (a, b) SELECT i, 'foo' FROM generate_series(1, 3) i RETURNING a, b;

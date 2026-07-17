@@ -268,14 +268,19 @@ ReconstructTargetListForInsert(TupleDesc pg_tupdesc, Query *query, List *duckdb_
 			 * The types of the columns that DuckDB returns don't necessarily
 			 * match the table column types exactly (e.g. a DuckDB VARCHAR
 			 * always maps to text, even when the column is of type varchar),
-			 * so add a cast when they differ.
+			 * so add a cast when they differ. We use COERCION_ASSIGNMENT
+			 * because that matches the semantics Postgres uses for INSERT:
+			 * most importantly, assignment casts throw an error when a value
+			 * doesn't fit the column type (e.g. a 6 character string into a
+			 * varchar(3) column), while an explicit cast would silently
+			 * truncate it.
 			 */
 			Oid source_type = exprType((Node *)target_entry->expr);
 			int32 source_typmod = exprTypmod((Node *)target_entry->expr);
 			if (source_type != attr->atttypid || source_typmod != attr->atttypmod) {
 				Expr *coerced_expr =
 				    (Expr *)coerce_to_target_type(NULL, (Node *)target_entry->expr, source_type, attr->atttypid,
-				                                  attr->atttypmod, COERCION_EXPLICIT, COERCE_IMPLICIT_CAST, -1);
+				                                  attr->atttypmod, COERCION_ASSIGNMENT, COERCE_IMPLICIT_CAST, -1);
 				if (coerced_expr == NULL) {
 					elog(ERROR, "cannot coerce column \"%s\" from type %s to type %s", NameStr(attr->attname),
 					     format_type_be(source_type), format_type_be(attr->atttypid));
