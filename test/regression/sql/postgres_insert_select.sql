@@ -53,6 +53,22 @@ INSERT INTO tbl SELECT r['s']::text FROM duckdb.query($$ SELECT 'abcdef' s $$) r
 SELECT * FROM tbl;
 DROP TABLE tbl;
 
+-- case: GENERATED and default columns are computed for rows produced by DuckDB
+CREATE TABLE tbl (a int, b int GENERATED ALWAYS AS (a * 2) STORED, c serial);
+INSERT INTO tbl (a) SELECT r['a']::int FROM duckdb.query($$ SELECT 21 a UNION ALL SELECT 33 $$) r;
+SELECT * FROM tbl ORDER BY a;
+DROP TABLE tbl;
+
+-- case: prepared statements with parameters
+CREATE TABLE tbl (a int, b text);
+PREPARE heap_insert(int) AS INSERT INTO tbl SELECT r['a']::int, r['b']::text FROM duckdb.query($$ SELECT 1 a, 'foo' b UNION ALL SELECT 2, 'bar' $$) r WHERE r['a']::int = $1;
+EXECUTE heap_insert(1);
+EXECUTE heap_insert(2);
+EXECUTE heap_insert(2);
+SELECT * FROM tbl ORDER BY a;
+DEALLOCATE heap_insert;
+DROP TABLE tbl;
+
 -- case: CTEs attached to the INSERT itself are not supported, because the
 -- WITH clause would be lost when only the SELECT runs in DuckDB
 CREATE TABLE tbl (a int, b text);
